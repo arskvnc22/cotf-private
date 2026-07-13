@@ -231,6 +231,7 @@ class InductionHopsFinalAnswerTask:
         filler tokens subject to the constraints needed to keep that traversal
         valid.
         """
+        print("method called")    #zonkzonkzonk
         if hops == 0:
             seq = self._sample_char_sequence()
             print(f"seq: {seq}")
@@ -244,29 +245,54 @@ class InductionHopsFinalAnswerTask:
                 f"seq_len={self.seq_len} is too short to construct a non-degenerate "
                 f"{hops}-hop chain; need at least {min_len}."
             )
+        # seq_len: int = 256,
+        # char_tokens: int = 4,
+        # min_hops: int = 16,
+        # max_hops: int = 16,
+        # rng: np.random.RandomState = None,
+        # ensure_exists: bool = True,
+        # max_resample_attempts: int = 10000,
+        # include_hop_token: bool = False,
+        # avoid_adjacent_repeats: bool = True,
+        # sampling_strategy: str = "rejection",
 
         chars = list(self.char_token_map.keys())
         print(f"chars: {chars}")
         for _ in range(self.max_resample_attempts):
             max_base = self.seq_len - hops - 2
+            print(f"max base: {max_base}")
             base_positions = sorted(
                 self.rng.choice(np.arange(1, max_base + 1), size=hops, replace=False)
-            )
+            )             # base positions are the seeds for the final tokens. if we pick a group of adjacent numbers it wouldnt work so ascending currents method fixes this
             print(f"base_positions: {base_positions}")
-            ascending_currents = [
-                int(position + offset)
-                for offset, position in enumerate(base_positions)
-            ]
-            current_positions = [self.seq_len - 1] + list(reversed(ascending_currents))
+            # ascending_currents = [
+            #     int(position + offset)
+            #     for offset, position in enumerate(base_positions)
+            # ]
+            ascending_currents = []
 
+            for offset, position in enumerate(base_positions):
+                print(f"offset {offset}, position {position} ")
+                new_value = position + offset
+                print(f"newval: {new_value}")
+                
+                standard_int = int(new_value)
+                
+                ascending_currents.append(standard_int)
+            print(f"ascending currents: {ascending_currents}")
+
+            current_positions = [self.seq_len - 1] + list(reversed(ascending_currents))
+            print(f"current pos: {current_positions}")
             path_tokens = [self.rng.choice(chars)]
+            print(f"path tok:{path_tokens}")
             for _ in range(hops):
                 choices = [char for char in chars if char != path_tokens[-1]]
                 path_tokens.append(self.rng.choice(choices))
 
-            fixed = {current_positions[0]: path_tokens[0]}
+            fixed = {current_positions[0]: path_tokens[0]} # 
+            print(f"fixed: {fixed}")
             forbidden = [set() for _ in range(self.seq_len)]
-
+            print(f"forbidden: {forbidden}")
             for hop_idx in range(1, hops + 1):
                 old_current = current_positions[hop_idx - 1]
                 new_current = current_positions[hop_idx]
@@ -335,7 +361,7 @@ class InductionHopsFinalAnswerTask:
     def get_tokens(self, metadata=False, hops=None):
         num_hops = self._sample_hops(hops)
         if self.sampling_strategy == "constructive":
-            seq, path = self._sample_constructive_sequence(num_hops)
+            seq, path = self._sample_constructive_sequence(num_hops) # pass in the bucket
             answer = path[-1][1]
         else:
             for _ in range(self.max_resample_attempts):
