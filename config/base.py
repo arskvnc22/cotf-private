@@ -29,10 +29,10 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument('--device', default='cuda:0', type=str)
     parser.add_argument('--iterations', default=25000, type=int)
     parser.add_argument('--lr', default=1e-3, type=float)
-    parser.add_argument('--final_div_factor', default=0.05, type=float)
+    parser.add_argument('--final_div_factor', default=0.05, type=float) # whats this?
     parser.add_argument('--warmup_percent', default=0.05, type=float)
     parser.add_argument('--weight_decay', default=0.1, type=float)
-    parser.add_argument('--beta1', default=0.9, type=float)
+    parser.add_argument('--beta1', default=0.9, type=float)    # whats this?
     parser.add_argument('--beta2', default=0.95, type=float)
     parser.add_argument('--scheduler', default='cos', choices=['linear', 'cos', 'none'])
     parser.add_argument('--opt', default='adamw', choices=['adamw', 'sgd', 'adafactor'])
@@ -54,6 +54,12 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument('--n_layer', default=24, type=int) # depths in att + ff blocks
     parser.add_argument('--n_embd', default=768, type=int) # embedding size / hidden size ... 
     parser.add_argument('--sequence_length', default=512, type=int)
+    parser.add_argument(
+        '--attention_mode',
+        default='causal',
+        choices=['causal', 'bidirectional'],
+        help='Token-attention direction. The default preserves causal language-model behavior.',
+    )
     parser.add_argument('--dtype', default="torch.bfloat16", type=str)
     parser.add_argument('--bias', default=False, type=bool)
     parser.add_argument('--compile', action='store_true') # if true then model is compiled 

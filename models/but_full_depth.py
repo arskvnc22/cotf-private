@@ -52,7 +52,7 @@ def apply_inplace_set(x_acc, x_val, dim):
     return full_tensor, new_slice
 
 
-class CausalSelfAttention(nn.Module):
+class CausalSelfAttention(nn.Module): # rather confusingly named. we can use bidirectional attention in this as well.,
 
     def __init__(self, config, lm_cache):
         super().__init__()
@@ -71,6 +71,14 @@ class CausalSelfAttention(nn.Module):
         self.cache_storage = lm_cache.get_storage_for_layer(self)
         self.config = config
         self.allow_cache_during_training = getattr(config, "allow_cache_during_training", False)
+        self.attention_mode = getattr(config, "attention_mode", "causal")
+        if self.attention_mode not in ("causal", "bidirectional"):
+            raise ValueError(f"Unsupported attention mode: {self.attention_mode}")
+        self.is_causal = self.attention_mode == "causal"
+        if not self.is_causal and config.attention_window_length is not None:
+            raise ValueError(
+                "attention_window_length is currently defined only for causal attention."
+            )
 
         # causal mask to ensure that attention is only applied to the left in the input sequence
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -110,12 +118,20 @@ class CausalSelfAttention(nn.Module):
             if att_prefix is not None:
                 raise NotImplementedError
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=self.is_causal,         # should be false when using bidirectional
+            )
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = pos_emb_closure.adapt_attention_before_softmax(att, start_query_index=start_index, start_key_index=start_index)
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            if self.is_causal:
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             if att_prefix is not None:
                 prefix_size = att_prefix.shape[-1]
                 current_size = att.shape[-1]
@@ -258,10 +274,23 @@ class GPTBase(nn.Module):
             raise NotImplementedError
         return token_depths
 
-    def forward(self, idx, targets=None, get_logits=False, use_cache=False, iter=None):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        get_logits=False,
+        use_cache=False,
+        iter=None,
+        return_all_logits=False,
+        num_repeats=None,
+        return_repeat_states=False,
+    ):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
+        repeats = self.n_repeat if num_repeats is None else int(num_repeats)
+        if repeats <= 0:
+            raise ValueError("num_repeats must be positive.")
         
         
         # forward the GPT model itself
@@ -276,17 +305,24 @@ class GPTBase(nn.Module):
             idx, pos_emb_closure = self.transformer.wpe(idx) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         x = self.transformer.drop(x)
-        x = pos_emb_closure.adapt_model_input(x, start_index=index_shift)
+        x = pos_emb_closure.adapt_model_input(x, start_index=index_shift) # does nothign with rope index shift is for autoregressive generation which we don't intend to use we dont have lm cacahe anywyay its annoying
        
         for block in self.transformer.h_begin:
             x = block(x, pos_emb_closure, cache_context, start_index=index_shift)
+
+        # Evaluation-only repeat diagnostics use these snapshots to determine
+        # whether the shared middle stack converges, cycles, or leaves the
+        # representation manifold. The first entry is the post-begin state.
+        repeat_states = [x] if return_repeat_states else None
         
         B, T, D = x.shape
         # fix_x = torch.zeros_like(x)
         # continue_prob = x.new_ones((B, T))
-        for rep_idx in range(1, self.n_repeat+1):
+        for rep_idx in range(1, repeats + 1):
             for block in self.transformer.h_mid:
                 x = block(x, pos_emb_closure, cache_context, start_index=index_shift)
+            if return_repeat_states:
+                repeat_states.append(x)
             
             
         for block in self.transformer.h_end:
@@ -296,16 +332,31 @@ class GPTBase(nn.Module):
 
         if use_cache:
             x = self.lm_cache.get_final_logits(x)
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
+        if targets is not None or return_all_logits:
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+
+        if targets is not None:
+            # if we are given some desired targets also calculate the loss
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
             loss = None
         logits = logits if get_logits else None
-        return {'logits': logits, 'loss': loss, 'average_depth': torch.as_tensor(self.n_repeat) * len(self.transformer.h_mid) + len(self.transformer.h_begin) + len(self.transformer.h_end)}
+        average_depth = (
+            repeats * len(self.transformer.h_mid)
+            + len(self.transformer.h_begin)
+            + len(self.transformer.h_end)
+        )
+        result = {
+            'logits': logits,
+            'loss': loss,
+            'average_depth': torch.as_tensor(average_depth, device=idx.device),
+        }
+        if return_repeat_states:
+            result['repeat_states'] = repeat_states
+        return result
 
     def clear_state(self):
         self.lm_cache.clear_state()

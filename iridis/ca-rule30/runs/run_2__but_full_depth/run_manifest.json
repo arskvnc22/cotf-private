@@ -1,0 +1,344 @@
+{
+  "annotations": {
+    "note": null,
+    "tags": []
+  },
+  "checkpoint_selection": {
+    "ca_best_length": 64,
+    "ca_best_metric": "exact_sequence_accuracy",
+    "ca_best_pair": [
+      4,
+      4
+    ],
+    "ca_extrapolation_best_metric": "cell_accuracy",
+    "ca_extrapolation_min_id_cell_accuracy": 0.99,
+    "ca_extrapolation_min_id_exact_sequence_accuracy": 0.95
+  },
+  "evaluation": {
+    "ca_eval_num_cells": [
+      64
+    ],
+    "ca_extrapolation_best_pair": [
+      9,
+      9
+    ],
+    "ca_extrapolation_val_pairs": [
+      [
+        5,
+        5
+      ],
+      [
+        6,
+        6
+      ],
+      [
+        7,
+        7
+      ],
+      [
+        8,
+        8
+      ],
+      [
+        9,
+        9
+      ]
+    ],
+    "ca_final_eval_pairs": [
+      [
+        10,
+        10
+      ]
+    ],
+    "ca_repeat_diagnostic_horizons": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "ca_repeat_diagnostic_max_repeats": 9,
+    "ca_test_samples": 4096,
+    "ca_val_samples": 4096,
+    "eval_freq": 250
+  },
+  "model": {
+    "attention_mode": "bidirectional",
+    "bias": false,
+    "depth_embedding": null,
+    "depth_random_method": "uniform",
+    "dropout": 0.0,
+    "min_repeat": 1,
+    "model": "but_full_depth",
+    "n_embd": 64,
+    "n_head": 4,
+    "n_layer": 1,
+    "n_layer_begin": 0,
+    "n_layer_end": 0,
+    "n_repeat": 1,
+    "positional_encoder": "rotary",
+    "sequence_length": 64,
+    "vocab_size": 2
+  },
+  "provenance": {
+    "checkpoint_dir": "/iridisfs/scratch/ab3u21/exps/cellular-automaton/rule30/but_full_depth/ca30_but_full_depth_embd_64_beg_0_mid_1x1_end_0_pairs_1x1_2x2_3x3_4x4_opt_adamw_lr_1e-3_wd_0.1_gc_0.9_mseed_0_dseed_1",
+    "dataset": "rule30",
+    "experiment_name": "ca30_but_full_depth_embd_64_beg_0_mid_1x1_end_0_pairs_1x1_2x2_3x3_4x4_opt_adamw_lr_1e-3_wd_0.1_gc_0.9_mseed_0_dseed_1",
+    "hostname": "ecsai02",
+    "run_dir": "/iridisfs/home/tak1e25/CoTFormer-private/iridis/ca-rule30/runs/run_2__but_full_depth",
+    "slurm_array_task_id": null,
+    "slurm_job_id": "1314070",
+    "slurm_job_name": "ca30_but_full_depth"
+  },
+  "resolved_args": {
+    "acc_steps": 1,
+    "act_penalty": 0.03,
+    "add_additional_space": false,
+    "allow_cache_during_training": false,
+    "attention_mode": "bidirectional",
+    "attention_window_length": null,
+    "batch_size": 128,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "bias": false,
+    "ca_bernoulli_p": 0.5,
+    "ca_best_length": 64,
+    "ca_best_metric": "exact_sequence_accuracy",
+    "ca_best_pair": [
+      4,
+      4
+    ],
+    "ca_boundary": "periodic",
+    "ca_data_mode": "materialized",
+    "ca_diagnostic_length": 64,
+    "ca_eval_batch_size": 128,
+    "ca_eval_max_batches": 32,
+    "ca_eval_num_cells": [
+      64
+    ],
+    "ca_exact_data_resume": false,
+    "ca_extrapolation_best_metric": "cell_accuracy",
+    "ca_extrapolation_best_pair": [
+      9,
+      9
+    ],
+    "ca_extrapolation_min_id_cell_accuracy": 0.99,
+    "ca_extrapolation_min_id_exact_sequence_accuracy": 0.95,
+    "ca_extrapolation_val_pairs": [
+      [
+        5,
+        5
+      ],
+      [
+        6,
+        6
+      ],
+      [
+        7,
+        7
+      ],
+      [
+        8,
+        8
+      ],
+      [
+        9,
+        9
+      ]
+    ],
+    "ca_final_eval_max_batches": 32,
+    "ca_final_eval_pairs": [
+      [
+        10,
+        10
+      ]
+    ],
+    "ca_final_external_steps": [],
+    "ca_log_every": 25,
+    "ca_log_fixed_cot_diagnostics": false,
+    "ca_note": null,
+    "ca_num_workers": 4,
+    "ca_repeat_diagnostic_examples": 1,
+    "ca_repeat_diagnostic_horizons": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "ca_repeat_diagnostic_max_batches": 32,
+    "ca_repeat_diagnostic_max_repeats": 9,
+    "ca_run_dir": "/home/tak1e25/CoTFormer-private/iridis/ca-rule30/runs/run_2__but_full_depth",
+    "ca_save_every": 5000,
+    "ca_steps": 1,
+    "ca_tags": [],
+    "ca_test_samples": 4096,
+    "ca_test_seed": 2000003,
+    "ca_train_num_cells": 64,
+    "ca_train_pairs": [
+      [
+        1,
+        1
+      ],
+      [
+        2,
+        2
+      ],
+      [
+        3,
+        3
+      ],
+      [
+        4,
+        4
+      ]
+    ],
+    "ca_train_samples": 100000,
+    "ca_val_samples": 4096,
+    "ca_val_seed": 1000003,
+    "cache_indexing_scheme": "by_total",
+    "cache_selection_method": "per_token_and_head",
+    "cache_topk": 1,
+    "compile": false,
+    "config_format": "base",
+    "data_dir": null,
+    "data_in_ram": false,
+    "data_seed": 1,
+    "dataset": "rule30",
+    "depth_embedding": null,
+    "depth_predictor_loss_coef": 1.0,
+    "depth_random_method": "uniform",
+    "device": "cuda:0",
+    "disable_ln_mid": false,
+    "distributed_backend": null,
+    "dropout": 0.0,
+    "dtype": "torch.bfloat16",
+    "eval_freq": 250,
+    "eval_length_factor": null,
+    "eval_sample_size": null,
+    "eval_seq_length": null,
+    "eval_seq_prefix": "Once upon a time",
+    "exp_name": "ca30_but_full_depth_embd_64_beg_0_mid_1x1_end_0_pairs_1x1_2x2_3x3_4x4_opt_adamw_lr_1e-3_wd_0.1_gc_0.9_mseed_0_dseed_1",
+    "final_div_factor": 0.05,
+    "grad_clip": 0.9,
+    "halt_threshold": 0.999,
+    "iterations": 5000,
+    "lm_cache": "none",
+    "lr": 0.001,
+    "mem_cache_size": null,
+    "min_repeat": 1,
+    "mod_capacity_factor": 0.6,
+    "model": "but_full_depth",
+    "multiple_of": 256,
+    "n_embd": 64,
+    "n_head": 4,
+    "n_layer": 1,
+    "n_layer_begin": 0,
+    "n_layer_end": 0,
+    "n_repeat": 1,
+    "opt": "adamw",
+    "optimization_process": null,
+    "pos_jump_freq": null,
+    "pos_jump_schedule": null,
+    "positional_encoder": "rotary",
+    "remove_intermediary_checkpoints_at_end": false,
+    "results_base_folder": "/scratch/ab3u21/exps/cellular-automaton",
+    "rmsnorm_eps": 1e-05,
+    "run_prefix": null,
+    "save_checkpoint_freq": null,
+    "scheduler": "none",
+    "seed": 0,
+    "sequence_length": 64,
+    "total_sequence_length": null,
+    "track_cache_attention": false,
+    "training_length_factor": null,
+    "use_pretrained": null,
+    "vocab_size": 2,
+    "wandb": false,
+    "wandb_entity": null,
+    "wandb_project": "my-project",
+    "warmup_percent": 0.05,
+    "weight_decay": 0.1,
+    "world_size": 1
+  },
+  "run_id": "run_2__but_full_depth",
+  "schema_version": 1,
+  "seeds": {
+    "ca_test_seed": 2000003,
+    "ca_val_seed": 1000003,
+    "data_seed": 1,
+    "seed": 0
+  },
+  "status": "completed",
+  "timestamps": {
+    "completed_at": "2026-07-25T15:43:24.999080+00:00",
+    "started_at": "2026-07-25T15:41:19.328898+00:00",
+    "updated_at": "2026-07-25T15:43:24.999052+00:00"
+  },
+  "training": {
+    "acc_steps": 1,
+    "batch_size": 128,
+    "beta1": 0.9,
+    "beta2": 0.95,
+    "ca_bernoulli_p": 0.5,
+    "ca_boundary": "periodic",
+    "ca_data_mode": "materialized",
+    "ca_num_workers": 4,
+    "ca_train_num_cells": 64,
+    "ca_train_pairs": [
+      [
+        1,
+        1
+      ],
+      [
+        2,
+        2
+      ],
+      [
+        3,
+        3
+      ],
+      [
+        4,
+        4
+      ]
+    ],
+    "ca_train_samples": 100000,
+    "final_div_factor": 0.05,
+    "grad_clip": 0.9,
+    "iterations": 5000,
+    "lr": 0.001,
+    "opt": "adamw",
+    "pairs": [
+      {
+        "ca_steps": 1,
+        "num_repeats": 1
+      },
+      {
+        "ca_steps": 2,
+        "num_repeats": 2
+      },
+      {
+        "ca_steps": 3,
+        "num_repeats": 3
+      },
+      {
+        "ca_steps": 4,
+        "num_repeats": 4
+      }
+    ],
+    "scheduler": "none",
+    "warmup_percent": 0.05,
+    "weight_decay": 0.1
+  }
+}

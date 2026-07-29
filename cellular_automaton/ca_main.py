@@ -37,10 +37,26 @@ from optim.runner_utils import (
 
 try:
     from .ca_gen import MaterializedRule30Dataset, Rule30Dataset
+    from .ca_reporting import (
+        MANIFEST_FILENAME,
+        build_run_manifest,
+        ensure_notes_file,
+        read_json,
+        update_run_manifest_status,
+        write_run_manifest,
+    )
     from .ca_train import train_ca
 except ImportError:
     # Support direct execution as ``python cellular_automaton/ca_main.py``.
     from ca_gen import MaterializedRule30Dataset, Rule30Dataset
+    from ca_reporting import (
+        MANIFEST_FILENAME,
+        build_run_manifest,
+        ensure_notes_file,
+        read_json,
+        update_run_manifest_status,
+        write_run_manifest,
+    )
     from ca_train import train_ca
 
 
@@ -158,6 +174,15 @@ def get_args():
         help=(
             "Restore the precise shuffle position after a checkpoint. By "
             "default a resumed run starts a fresh DataLoader pass."
+        ),
+    )
+    parser.add_argument(
+        "--ca_shuffle_seed",
+        type=int,
+        default=None,
+        help=(
+            "Seed controlling training-row order. Defaults to --data_seed so "
+            "existing experiments retain their current ordering."
         ),
     )
     parser.add_argument("--ca_num_workers", type=int, default=0)
@@ -279,6 +304,28 @@ def get_args():
         help="Target CA horizons for repeated full-model rollout.",
     )
     parser.add_argument("--ca_final_eval_max_batches", type=int, default=None)
+    parser.add_argument(
+        "--ca_run_dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional scheduler-side run directory. When provided, resolved "
+            "metadata, normalized metrics, and notes are written beside the "
+            "Slurm logs."
+        ),
+    )
+    parser.add_argument(
+        "--ca_tags",
+        nargs="*",
+        default=[],
+        help="Searchable free-form tags stored in the run manifest.",
+    )
+    parser.add_argument(
+        "--ca_note",
+        type=str,
+        default=None,
+        help="Short searchable experiment note stored in the run manifest.",
+    )
 
     # The existing configuration format adds all shared optimizer, model,
     # logging, and distributed arguments before the one final parse.  Keeping a
@@ -327,7 +374,7 @@ def make_loader(
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle if sampler is None else False,
+        shuffle=shuffle if sampler is None else False, # if ddp DistributedSampler owns shuffling
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -337,7 +384,8 @@ def make_loader(
 
 def make_ca_dataloaders(args, distributed_backend):
     """Build training, fixed validation, and independent final-test loaders."""
-    train_seed = int(args.data_seed)
+    train_data_seed = int(args.data_seed)
+    shuffle_seed = int(args.ca_shuffle_seed)
     pin_memory = args.device.type == "cuda"
     dataset_class = (
         MaterializedRule30Dataset
@@ -350,13 +398,13 @@ def make_ca_dataloaders(args, distributed_backend):
         num_cells=args.ca_train_num_cells,
         steps=args.ca_steps,
         bernoulli_p=args.ca_bernoulli_p,
-        seed=train_seed,
+        seed=train_data_seed,
     )
     train_loader = make_loader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        seed=train_seed,
+        seed=shuffle_seed,
         num_workers=args.ca_num_workers,
         pin_memory=pin_memory,
         distributed=True,
@@ -490,6 +538,8 @@ def apply_ca_task_config(args, distributed_backend):
 
     if args.ca_test_samples is None:
         args.ca_test_samples = args.ca_val_samples
+    if args.ca_shuffle_seed is None:
+        args.ca_shuffle_seed = int(args.data_seed)
     if (
         args.ca_train_samples <= 0
         or args.ca_val_samples <= 0
@@ -626,7 +676,7 @@ def apply_ca_task_config(args, distributed_backend):
     args.dataset = CA_TASK_NAME
 
 
-def seed_process(args):
+def seed_global_training_rngs(args):
     """Seed the random sources currently used by the repository."""
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -639,14 +689,51 @@ def main(args):
     torch.backends.cudnn.allow_tf32 = True
 
     distributed_backend = distributed.make_backend_from_args(args)
+    reporting_run_dir = None
     try:
         args = distributed_backend.get_adjusted_args_for_process(args)
         args.device = torch.device(args.device)
         if args.device.type == "cuda":
             torch.cuda.set_device(args.device)
 
-        seed_process(args)
+        seed_global_training_rngs(args)
         apply_ca_task_config(args, distributed_backend)
+        args.world_size = distributed_backend.get_world_size()
+        checkpoint_dir = Path(
+            args.results_base_folder,
+            args.dataset,
+            args.model,
+            args.exp_name,
+        )
+
+        if args.ca_run_dir is not None and distributed_backend.is_master_process():
+            reporting_run_dir = Path(args.ca_run_dir)
+            manifest_path = reporting_run_dir / MANIFEST_FILENAME
+            existing_manifest = (
+                read_json(manifest_path) if manifest_path.is_file() else None
+            )
+            manifest = build_run_manifest(
+                sanitize_for_json(vars(args)),
+                reporting_run_dir,
+                checkpoint_dir,
+                status="running",
+                existing=existing_manifest,
+            )
+            write_run_manifest(reporting_run_dir, manifest)
+            ensure_notes_file(reporting_run_dir)
+
+        if (checkpoint_dir / "summary.json").is_file():
+            print_master(
+                distributed_backend,
+                f"Already found completed experiment '{checkpoint_dir}'. Skipping.",
+            )
+            if reporting_run_dir is not None:
+                update_run_manifest_status(reporting_run_dir, "skipped")
+            return
+        if distributed_backend.is_master_process():
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        distributed_backend.sync()
+
         train_loader, eval_loaders, test_loaders = make_ca_dataloaders(
             args, distributed_backend
         )
@@ -671,23 +758,6 @@ def main(args):
                 "Variable CA training/evaluation pairs require a model whose "
                 "forward method accepts num_repeats."
             )
-
-        args.world_size = distributed_backend.get_world_size()
-        checkpoint_dir = Path(
-            args.results_base_folder,
-            args.dataset,
-            args.model,
-            args.exp_name,
-        )
-        if (checkpoint_dir / "summary.json").is_file():
-            print_master(
-                distributed_backend,
-                f"Already found completed experiment '{checkpoint_dir}'. Skipping.",
-            )
-            return
-        if distributed_backend.is_master_process():
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        distributed_backend.sync()
 
         resume_path = resolve_resume_checkpoint(args, checkpoint_dir)
         if resume_path is not None and not resume_path.is_file():
@@ -729,6 +799,7 @@ def main(args):
                 "bernoulli_p": args.ca_bernoulli_p,
                 "data_mode": args.ca_data_mode,
                 "exact_data_resume": args.ca_exact_data_resume,
+                "shuffle_seed": args.ca_shuffle_seed,
                 "train_samples": args.ca_train_samples,
                 "val_samples": args.ca_val_samples,
                 "val_seed": args.ca_val_seed,
@@ -780,6 +851,23 @@ def main(args):
             import wandb
 
             wandb.finish()
+        if reporting_run_dir is not None:
+            update_run_manifest_status(reporting_run_dir, "completed")
+    except BaseException as error:
+        if reporting_run_dir is not None:
+            try:
+                update_run_manifest_status(
+                    reporting_run_dir,
+                    "failed",
+                    error=error,
+                )
+            except Exception as reporting_error:
+                print(
+                    "WARNING: failed to record run failure in the manifest: "
+                    f"{reporting_error}",
+                    file=sys.stderr,
+                )
+        raise
     finally:
         distributed_backend.finalize()
 

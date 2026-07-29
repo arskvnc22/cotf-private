@@ -56,7 +56,12 @@ SCHEDULER="${SCHEDULER:-none}"
 LR="${LR:-1e-3}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 GRAD_CLIP="${GRAD_CLIP:-0.9}"
+DROPOUT="${DROPOUT:-0.0}"
+# Model initialization and training-row generation use independent defaults.
+# Holding DATA_SEED fixed while sweeping SEED isolates initialization variance.
 SEED="${SEED:-0}"
+DATA_SEED="${DATA_SEED:-1}"
+SHUFFLE_SEED="${SHUFFLE_SEED:-1}"
 
 CA_TRAIN_PAIRS="${CA_TRAIN_PAIRS:-1:1 2:2 3:3}"
 # Empty values let ca_main.py derive the largest configured pair.
@@ -147,8 +152,20 @@ while [ "$ARG_INDEX" -lt "${#CLI_ARGS[@]}" ]; do
             GRAD_CLIP="${CLI_ARGS[$((ARG_INDEX + 1))]}"
             ARG_INDEX=$((ARG_INDEX + 2))
             ;;
+        --dropout)
+            DROPOUT="${CLI_ARGS[$((ARG_INDEX + 1))]}"
+            ARG_INDEX=$((ARG_INDEX + 2))
+            ;;
         --seed)
             SEED="${CLI_ARGS[$((ARG_INDEX + 1))]}"
+            ARG_INDEX=$((ARG_INDEX + 2))
+            ;;
+        --data_seed)
+            DATA_SEED="${CLI_ARGS[$((ARG_INDEX + 1))]}"
+            ARG_INDEX=$((ARG_INDEX + 2))
+            ;;
+        --ca_shuffle_seed)
+            SHUFFLE_SEED="${CLI_ARGS[$((ARG_INDEX + 1))]}"
             ARG_INDEX=$((ARG_INDEX + 2))
             ;;
         --ca_extrapolation_min_id_cell_accuracy)
@@ -202,7 +219,7 @@ MODEL_RUN_NAME="${MODEL_RUN_NAME:-$MODEL}"
 MODEL_TAG="${MODEL//[^a-zA-Z0-9_-]/_}"
 TRAIN_PAIR_TAG="${CA_TRAIN_PAIRS//:/x}"
 TRAIN_PAIR_TAG="${TRAIN_PAIR_TAG// /_}"
-EXP_NAME="${EXP_NAME:-ca30_${MODEL_TAG}_embd_${N_EMBD}_beg_${N_LAYER_BEGIN}_mid_${N_LAYER}x${N_REPEAT}_end_${N_LAYER_END}_pairs_${TRAIN_PAIR_TAG}_opt_${OPT}_lr_${LR}_wd_${WEIGHT_DECAY}_gc_${GRAD_CLIP}_seed_${SEED}}"
+EXP_NAME="${EXP_NAME:-ca30_${MODEL_TAG}_embd_${N_EMBD}_beg_${N_LAYER_BEGIN}_mid_${N_LAYER}x${N_REPEAT}_end_${N_LAYER_END}_pairs_${TRAIN_PAIR_TAG}_opt_${OPT}_lr_${LR}_wd_${WEIGHT_DECAY}_gc_${GRAD_CLIP}_mseed_${SEED}_dseed_${DATA_SEED}}"
 
 read -r -a TRAIN_PAIR_ARGS <<< "$CA_TRAIN_PAIRS"
 read -r -a EXTRAPOLATION_PAIR_ARGS <<< "$CA_EXTRAPOLATION_VAL_PAIRS"
@@ -282,7 +299,9 @@ if [ -z "$SLURM_JOB_ID" ]; then
     echo "  Final eval pairs: ${CA_FINAL_EVAL_PAIRS:-none}"
     echo "  Optimizer:        $OPT"
     echo "  LR / WD / clip:   $LR / $WEIGHT_DECAY / $GRAD_CLIP"
-    echo "  Seed:             $SEED"
+    echo "  Model seed:       $SEED"
+    echo "  Data seed:        $DATA_SEED"
+    echo "  Shuffle seed:     $SHUFFLE_SEED"
     echo "  Experiment:       $EXP_NAME"
     echo ""
     exec "$SBATCH_BIN" \
@@ -357,10 +376,13 @@ echo " Scheduler:        $SCHEDULER"
 echo " Learning rate:    $LR"
 echo " Weight decay:     $WEIGHT_DECAY"
 echo " Gradient clip:    $GRAD_CLIP"
+echo " Dropout:          $DROPOUT"
 echo " Iterations:       $ITERATIONS"
 echo " Evaluation:       every $EVAL_FREQ steps, at most $EVAL_MAX_BATCHES batches"
 echo " Data workers:     $NUM_WORKERS"
-echo " Seed:             $SEED"
+echo " Model seed:       $SEED"
+echo " Data seed:        $DATA_SEED"
+echo " Shuffle seed:     $SHUFFLE_SEED"
 echo " Experiment:       $EXP_NAME"
 echo " Results:          $EXPS_DIR"
 echo " Run directory:    $RUN_DIR"
@@ -386,7 +408,7 @@ TRAIN_ARGS=(
     --sequence_length "$NUM_CELLS"
     --batch_size "$BATCH_SIZE"
     --acc_steps "$ACC_STEPS"
-    --dropout 0.0
+    --dropout "$DROPOUT"
     --iterations "$ITERATIONS"
     --opt "$OPT"
     --scheduler "$SCHEDULER"
@@ -395,8 +417,11 @@ TRAIN_ARGS=(
     --grad_clip "$GRAD_CLIP"
     --eval_freq "$EVAL_FREQ"
     --seed "$SEED"
+    --data_seed "$DATA_SEED"
+    --ca_shuffle_seed "$SHUFFLE_SEED"
     --results_base_folder "$EXPS_DIR"
     --exp_name "$EXP_NAME"
+    --ca_run_dir "$RUN_DIR"
     --use_pretrained None
     --ca_data_mode materialized
     --ca_train_num_cells "$NUM_CELLS"
