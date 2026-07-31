@@ -1,5 +1,6 @@
 """Training loop dedicated to cellular-automaton row prediction."""
 
+import copy
 import inspect
 import json
 import math
@@ -27,7 +28,12 @@ try:
         format_ca_repeat_examples,
         run_final_ca_evaluation,
     )
+    from .ca_exposure import (
+        add_training_exposure,
+        rebuild_training_exposure,
+    )
     from .ca_gen import apply_rule30
+    from .ca_reporting import write_eval_metrics
 except ImportError:
     from ca_eval import (
         ca_pair_key,
@@ -37,7 +43,9 @@ except ImportError:
         format_ca_repeat_examples,
         run_final_ca_evaluation,
     )
+    from ca_exposure import add_training_exposure, rebuild_training_exposure
     from ca_gen import apply_rule30
+    from ca_reporting import write_eval_metrics
 
 
 def _autocast_context(args):
@@ -321,6 +329,18 @@ def train_ca(
         for step, values in stats["eval"].items()
         if int(step) <= start_step
     }
+    training_world_size = distributed_backend.get_world_size()
+    training_exposure = rebuild_training_exposure(
+        stats["train"],
+        materialized_training_rows=len(train_loader.dataset),
+        batch_size=args.batch_size,
+        accumulation_steps=args.acc_steps,
+        world_size=training_world_size,
+        num_cells=args.ca_train_num_cells,
+        fallback_ca_steps=args.ca_steps,
+        fallback_num_repeats=args.n_repeat,
+    )
+    stats["training_exposure"] = training_exposure
 
     def selection_is_usable(info):
         return (
@@ -370,6 +390,8 @@ def train_ca(
 
     timing_start = time.perf_counter()
     interval_steps = 0
+    interval_examples = 0
+    interval_cells = 0
     interval_data_wait = 0.0
     interval_pair_loss_sums = {ca_pair_key(*pair): 0.0 for pair in train_pairs}
     interval_pair_loss_counts = {ca_pair_key(*pair): 0 for pair in train_pairs}
@@ -461,6 +483,7 @@ def train_ca(
                 "in_distribution": in_distribution_eval,
                 "extrapolation_validation": extrapolation_eval,
                 "repeat_diagnostics": repeat_diagnostics,
+                "training_exposure": copy.deepcopy(training_exposure),
             }
             stats["eval"][str(step)] = eval_record
             candidate_key = ca_selection_key(selected_metrics, args.ca_best_metric)
@@ -693,6 +716,8 @@ def train_ca(
                 _add_fixed_cot_diagnostics(logs, raw_model, diagnostic_outputs)
             _wandb_log(args, logs, step)
             _write_json(stats_path, stats)
+            if args.ca_run_dir is not None:
+                write_eval_metrics(args.ca_run_dir, stats)
             timing_start += time.perf_counter() - excluded_start
         distributed_backend.sync()
 
@@ -703,6 +728,9 @@ def train_ca(
         model.train()
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
+        examples_this_step = 0
+        cells_this_step = 0
+        microbatches_this_step = 0
         active_pair = training_pair_for_step(train_pairs, step)
         if active_pair is not None:
             active_ca_steps, active_num_repeats = active_pair
@@ -718,6 +746,9 @@ def train_ca(
             inputs = batch["input_id"].to(
                 args.device, dtype=torch.long, non_blocking=pin_memory
             )
+            examples_this_step += int(inputs.shape[0]) * training_world_size
+            cells_this_step += int(inputs.numel()) * training_world_size
+            microbatches_this_step += 1
             if active_pair is None:
                 labels = batch["label"].to(
                     args.device, dtype=torch.long, non_blocking=pin_memory
@@ -769,30 +800,44 @@ def train_ca(
             "step": completed_step,
             "loss": mean_loss,
             "grad_norm": grad_norm,
+            "ca_steps": (
+                active_ca_steps if active_pair is not None else args.ca_steps
+            ),
+            "num_repeats": (
+                active_num_repeats if active_pair is not None else args.n_repeat
+            ),
+            "microbatches_this_step": microbatches_this_step,
+            "examples_this_step": examples_this_step,
+            "cells_this_step": cells_this_step,
         }
         if active_pair is not None:
-            train_row.update(
-                {"ca_steps": active_ca_steps, "num_repeats": active_num_repeats}
-            )
             interval_pair_loss_sums[active_pair_key] += mean_loss
             interval_pair_loss_counts[active_pair_key] += 1
         stats["train"].append(train_row)
+        add_training_exposure(
+            training_exposure,
+            ca_steps=train_row["ca_steps"],
+            num_repeats=train_row["num_repeats"],
+            optimizer_steps=1,
+            microbatches=microbatches_this_step,
+            examples_seen=examples_this_step,
+            cells_seen=cells_this_step,
+        )
+        stats["training_exposure"] = training_exposure
         interval_steps += 1
+        interval_examples += examples_this_step
+        interval_cells += cells_this_step
 
         if completed_step % log_every == 0 or completed_step == args.iterations:
             if distributed_backend.is_master_process():
                 elapsed = time.perf_counter() - timing_start
                 step_seconds = elapsed / interval_steps
-                world_size = distributed_backend.get_world_size()
-                examples_per_step = args.batch_size * args.acc_steps * world_size
                 timing = {
                     "step": completed_step,
                     "step_ms": step_seconds * 1000.0,
                     "data_wait_ms": interval_data_wait * 1000.0 / interval_steps,
-                    "examples_per_second": examples_per_step / step_seconds,
-                    "cells_per_second": (
-                        examples_per_step * args.ca_train_num_cells / step_seconds
-                    ),
+                    "examples_per_second": interval_examples / elapsed,
+                    "cells_per_second": interval_cells / elapsed,
                     "eta_hours": (
                         (args.iterations - completed_step) * step_seconds / 3600.0
                     ),
@@ -810,6 +855,32 @@ def train_ca(
                             "train_loss": mean_loss,
                             "grad_norm": grad_norm,
                             **({"pair_losses": pair_losses} if pair_losses else {}),
+                            "training_exposure": {
+                                "materialized_training_rows": training_exposure[
+                                    "materialized_training_rows"
+                                ],
+                                "total_examples_seen": training_exposure[
+                                    "total_examples_seen"
+                                ],
+                                "total_cells_seen": training_exposure[
+                                    "total_cells_seen"
+                                ],
+                                "equivalent_dataset_passes": training_exposure[
+                                    "equivalent_dataset_passes"
+                                ],
+                                "examples_seen_by_pair": {
+                                    key: values["examples_seen"]
+                                    for key, values in training_exposure[
+                                        "by_training_pair"
+                                    ].items()
+                                },
+                                "example_fraction_by_pair": {
+                                    key: values["example_fraction"]
+                                    for key, values in training_exposure[
+                                        "by_training_pair"
+                                    ].items()
+                                },
+                            },
                             **timing,
                         }
                     ),
@@ -826,15 +897,35 @@ def train_ca(
                     "train/examples_per_second": timing["examples_per_second"],
                     "train/cells_per_second": timing["cells_per_second"],
                     "train/eta_hours": timing["eta_hours"],
+                    "train/total_examples_seen": training_exposure[
+                        "total_examples_seen"
+                    ],
+                    "train/total_cells_seen": training_exposure[
+                        "total_cells_seen"
+                    ],
+                    "train/equivalent_dataset_passes": training_exposure[
+                        "equivalent_dataset_passes"
+                    ],
                     "lr": current_lr,
                 }
                 for key, value in pair_losses.items():
                     logs[f"train_pair/{key}/loss"] = value
+                for key, values in training_exposure[
+                    "by_training_pair"
+                ].items():
+                    logs[f"train_pair/{key}/examples_seen"] = values[
+                        "examples_seen"
+                    ]
+                    logs[f"train_pair/{key}/example_fraction"] = values[
+                        "example_fraction"
+                    ]
                 if args.ca_log_fixed_cot_diagnostics:
                     _add_fixed_cot_diagnostics(logs, raw_model)
                 _wandb_log(args, logs, completed_step)
             timing_start = time.perf_counter()
             interval_steps = 0
+            interval_examples = 0
+            interval_cells = 0
             interval_data_wait = 0.0
             for key in interval_pair_loss_sums:
                 interval_pair_loss_sums[key] = 0.0
@@ -850,6 +941,8 @@ def train_ca(
                 distributed_backend=distributed_backend,
                 data_state=current_data_state(),
             )
+            if distributed_backend.is_master_process():
+                _write_json(stats_path, stats)
 
     evaluate_and_maybe_select(args.iterations)
     save_training_checkpoint(
@@ -1015,6 +1108,8 @@ def train_ca(
                 ],
             )
         _write_json(checkpoint_dir / "summary.json", stats)
+        if args.ca_run_dir is not None:
+            write_eval_metrics(args.ca_run_dir, stats)
         final_logs = {
             "iter": args.iterations,
             "best_id/step": best_id_info["step"],
