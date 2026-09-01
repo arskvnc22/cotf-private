@@ -18,7 +18,7 @@ from torch.nn import functional as F
 from . import positional_encoders, caches
 
 from .utils import LayerNorm
-debug =True
+debug = False
 def print_deb(string):
     if debug:
         print(string)
@@ -26,7 +26,7 @@ def print_deb(string):
 class InPlaceSetSlice(torch.autograd.Function):
     @staticmethod
     def forward(ctx, full_tensor, last_slice, x_val, dim):
-        
+
         if last_slice is None:
             prev_length = 0
         else:
@@ -79,6 +79,14 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         if self.attention_mode not in ("causal","bidirectional"):
             raise ValueError(f"Unsupported attention mode: {self.attention_mode}")
         self.is_causal = self.attention_mode == "causal"
+        self.attention_implementation = getattr(
+            config, "attention_implementation", "sdpa"
+        )
+        if self.attention_implementation not in ("sdpa", "manual"):
+            raise ValueError(
+                "Unsupported attention implementation: "
+                f"{self.attention_implementation}"
+            )
 
 
         # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -107,7 +115,6 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         attention_mask=None,
     ):
         B, H, Q, K = attention_probabilities.shape
-        print(f"B:{B} || H : {H}, || Q:{Q} ||K{K}")
         diagnostics={}
 
         if K % tokens_per_repeat != 0:
@@ -117,6 +124,14 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         print_deb(f"attention proba contiguous: {attention_probabilities.is_contiguous()}")
         cached_repeats = K // tokens_per_repeat
         diagnostics['cached_repeats'] = cached_repeats
+        finite_logits = torch.isfinite(attention_logits)
+        visible_token_count = finite_logits.sum(dim=-1) # B,H,Q
+        visible_repeat_mask = finite_logits.reshape(
+            B, H, Q, cached_repeats, tokens_per_repeat
+        ).any(dim=-1) # B,H,Q,R
+        visible_repeat_count = visible_repeat_mask.sum(dim=-1) # B,H,Q
+        diagnostics['visible_token_count'] = visible_token_count
+        diagnostics['visible_repeat_count'] = visible_repeat_count
         print_deb(f"cached reps {cached_repeats}")
         print_deb(f"k over c = {K//cached_repeats}")
         # rerepeat_masses = attention_probabilities.view(B,H,Q,cached_repeats,Q)
@@ -127,6 +142,7 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         )
         #print(f"attention by repeat shape {attention_by_repea t.shape}")
         repeat_mass = attention_by_repeat.sum(dim=-1) #B,H,T,R
+        diagnostics['repeat_mass'] = repeat_mass
         #print(f"repeat mass shape {repeat_mass.shape}")
         # per_head_repeat_mass = repeat_mass()
         head_repeat_mass = repeat_mass.mean(dim=(0,2)) # H,R
@@ -137,10 +153,16 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         repeat_entropy=-torch.xlogy(repeat_mass,repeat_mass).sum(dim=-1)
         diagnostics['repeat_entropy'] = repeat_entropy
         #print(f"repeat entropy = {repeat_entropy.shape}")
-        if cached_repeats == 1:
-            normalised_repeat_entropy = torch.zeros_like(repeat_entropy)
-        else:
-            normalised_repeat_entropy = repeat_entropy / math.log(cached_repeats)
+        repeat_entropy_denominator = visible_repeat_count.to(
+            repeat_entropy.dtype
+        ).clamp_min(1).log()
+        normalised_repeat_entropy = torch.where(
+            visible_repeat_count > 1,
+            repeat_entropy / repeat_entropy_denominator.clamp_min(
+                torch.finfo(repeat_entropy.dtype).tiny
+            ),
+            torch.zeros_like(repeat_entropy),
+        )
         diagnostics['normalised_repeat_entropy'] = normalised_repeat_entropy
         head_repeat_entropy = repeat_entropy.mean(dim=(0,2)) # H
         diagnostics['head_repeat_entropy'] = head_repeat_entropy
@@ -180,11 +202,16 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
             dtype=torch.long,
         )
         diagnostics['selected_query_indices'] = selected_query_indices
-        diagnostics['selected_query_attention'] = attention_by_repeat.index_select(
+        selected_query_attention_per_example = attention_by_repeat.index_select(
             2, selected_query_tensor
-        ).mean(dim=0) # H,selected_queries,R,T
+        ) # B,H,selected_queries,R,T
+        diagnostics['selected_query_attention_per_example'] = (
+            selected_query_attention_per_example
+        )
+        diagnostics['selected_query_attention'] = (
+            selected_query_attention_per_example.mean(dim=0)
+        ) # H,selected_queries,R,T
 
-        finite_logits = torch.isfinite(attention_logits)
         finite_logit_count = finite_logits.sum(dim=-1)
         safe_logit_count = finite_logit_count.clamp_min(1)
         finite_logit_values = torch.where(
@@ -245,10 +272,16 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         diagnostics['attention_entropy'] = attention_entropy
         diagnostics['head_attention_entropy'] = attention_entropy.mean(dim=(0,2))
         diagnostics['macro_attention_entropy'] = attention_entropy.mean()
-        if K == 1:
-            normalised_attention_entropy = torch.zeros_like(attention_entropy)
-        else:
-            normalised_attention_entropy = attention_entropy / math.log(K)
+        attention_entropy_denominator = visible_token_count.to(
+            attention_entropy.dtype
+        ).clamp_min(1).log()
+        normalised_attention_entropy = torch.where(
+            visible_token_count > 1,
+            attention_entropy / attention_entropy_denominator.clamp_min(
+                torch.finfo(attention_entropy.dtype).tiny
+            ),
+            torch.zeros_like(attention_entropy),
+        )
         diagnostics['normalised_attention_entropy'] = normalised_attention_entropy
         diagnostics['head_normalised_attention_entropy'] = (
             normalised_attention_entropy.mean(dim=(0,2))
@@ -261,7 +294,9 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         diagnostics['effective_support'] = effective_support
         diagnostics['head_effective_support'] = effective_support.mean(dim=(0,2))
         diagnostics['macro_effective_support'] = effective_support.mean()
-        effective_support_fraction = effective_support / K
+        effective_support_fraction = effective_support / visible_token_count.to(
+            effective_support.dtype
+        ).clamp_min(1)
         diagnostics['effective_support_fraction'] = effective_support_fraction
         diagnostics['head_effective_support_fraction'] = (
             effective_support_fraction.mean(dim=(0,2))
@@ -282,10 +317,35 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         logits_by_repeat = attention_logits.reshape(
             B, H, Q, cached_repeats, tokens_per_repeat
         )
-        repeat_logsumexp = torch.logsumexp(logits_by_repeat, dim=-1) # B,H,Q,R
+        raw_repeat_logsumexp = torch.logsumexp(
+            logits_by_repeat, dim=-1
+        ) # B,H,Q,R
+        repeat_logsumexp_valid = visible_repeat_mask
+        repeat_logsumexp = torch.where(
+            repeat_logsumexp_valid,
+            raw_repeat_logsumexp,
+            torch.zeros_like(raw_repeat_logsumexp),
+        )
         diagnostics['repeat_logsumexp'] = repeat_logsumexp
-        diagnostics['head_repeat_logsumexp'] = repeat_logsumexp.mean(dim=(0,2))
-        diagnostics['macro_repeat_logsumexp'] = repeat_logsumexp.mean(dim=(0,1,2))
+        diagnostics['repeat_logsumexp_valid'] = repeat_logsumexp_valid
+        head_repeat_logsumexp_count = repeat_logsumexp_valid.sum(
+            dim=(0,2)
+        )
+        diagnostics['head_repeat_logsumexp'] = repeat_logsumexp.sum(
+            dim=(0,2)
+        ) / head_repeat_logsumexp_count.clamp_min(1)
+        diagnostics['head_repeat_logsumexp_valid'] = (
+            head_repeat_logsumexp_count > 0
+        )
+        macro_repeat_logsumexp_count = repeat_logsumexp_valid.sum(
+            dim=(0,1,2)
+        )
+        diagnostics['macro_repeat_logsumexp'] = repeat_logsumexp.sum(
+            dim=(0,1,2)
+        ) / macro_repeat_logsumexp_count.clamp_min(1)
+        diagnostics['macro_repeat_logsumexp_valid'] = (
+            macro_repeat_logsumexp_count > 0
+        )
 
         recent_repeat_count = 1 if recent_window is None else int(recent_window)
         if recent_repeat_count <= 0:
@@ -294,23 +354,46 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         diagnostics['recent_repeat_count'] = recent_repeat_count
         if recent_repeat_count < cached_repeats:
             recent_logsumexp = torch.logsumexp(
-                repeat_logsumexp[..., -recent_repeat_count:], dim=-1
+                raw_repeat_logsumexp[..., -recent_repeat_count:], dim=-1
             )
             old_logsumexp = torch.logsumexp(
-                repeat_logsumexp[..., :-recent_repeat_count], dim=-1
+                raw_repeat_logsumexp[..., :-recent_repeat_count], dim=-1
             )
-            recent_vs_old_margin = recent_logsumexp - old_logsumexp
+            recent_vs_old_margin_valid = torch.isfinite(
+                recent_logsumexp
+            ) & torch.isfinite(old_logsumexp)
+            raw_recent_vs_old_margin = recent_logsumexp - old_logsumexp
+            recent_vs_old_margin = torch.where(
+                recent_vs_old_margin_valid,
+                raw_recent_vs_old_margin,
+                torch.zeros_like(raw_recent_vs_old_margin),
+            )
             diagnostics['recent_vs_old_logsumexp_margin'] = recent_vs_old_margin
-            diagnostics['head_recent_vs_old_logsumexp_margin'] = (
-                recent_vs_old_margin.mean(dim=(0,2))
+            diagnostics['recent_vs_old_logsumexp_margin_valid'] = (
+                recent_vs_old_margin_valid
             )
+            head_margin_count = recent_vs_old_margin_valid.sum(dim=(0,2))
+            diagnostics['head_recent_vs_old_logsumexp_margin'] = (
+                recent_vs_old_margin.sum(dim=(0,2))
+                / head_margin_count.clamp_min(1)
+            )
+            diagnostics['head_recent_vs_old_logsumexp_margin_valid'] = (
+                head_margin_count > 0
+            )
+            macro_margin_count = recent_vs_old_margin_valid.sum()
             diagnostics['macro_recent_vs_old_logsumexp_margin'] = (
-                recent_vs_old_margin.mean()
+                recent_vs_old_margin.sum() / macro_margin_count.clamp_min(1)
+            )
+            diagnostics['macro_recent_vs_old_logsumexp_margin_valid'] = (
+                macro_margin_count > 0
             )
         else:
             diagnostics['recent_vs_old_logsumexp_margin'] = None
+            diagnostics['recent_vs_old_logsumexp_margin_valid'] = None
             diagnostics['head_recent_vs_old_logsumexp_margin'] = None
+            diagnostics['head_recent_vs_old_logsumexp_margin_valid'] = None
             diagnostics['macro_recent_vs_old_logsumexp_margin'] = None
+            diagnostics['macro_recent_vs_old_logsumexp_margin_valid'] = None
 
         repeat_ages = torch.arange(
             cached_repeats - 1,
@@ -338,7 +421,9 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         diagnostics['head_repeat_age_band_mass'] = age_band_mass.mean(dim=(0,2))
         diagnostics['macro_repeat_age_band_mass'] = age_band_mass.mean(dim=(0,1,2))
 
-        head_jensen_shannon = attention_probabilities.new_zeros((H, H))
+        head_jensen_shannon_per_example = attention_probabilities.new_zeros(
+            (B, H, H)
+        )
         probability_floor = torch.finfo(attention_probabilities.dtype).tiny
         for left_head in range(H):
             for right_head in range(left_head + 1, H):
@@ -360,9 +445,17 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
                         right_probability / midpoint_probability,
                     ).sum(dim=-1)
                 )
-                mean_divergence = divergence.mean()
-                head_jensen_shannon[left_head, right_head] = mean_divergence
-                head_jensen_shannon[right_head, left_head] = mean_divergence
+                per_example_divergence = divergence.mean(dim=-1)
+                head_jensen_shannon_per_example[:, left_head, right_head] = (
+                    per_example_divergence
+                )
+                head_jensen_shannon_per_example[:, right_head, left_head] = (
+                    per_example_divergence
+                )
+        diagnostics['head_jensen_shannon_divergence_per_example'] = (
+            head_jensen_shannon_per_example
+        )
+        head_jensen_shannon = head_jensen_shannon_per_example.mean(dim=0)
         diagnostics['head_jensen_shannon_divergence'] = head_jensen_shannon
         diagnostics['normalised_head_jensen_shannon_divergence'] = (
             head_jensen_shannon / math.log(2)
@@ -447,7 +540,7 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         self._lazy_init_cache_length = None
         
 
-    def forward(self, x, pos_emb_closure, cache_context, start_index, indices,collect_attention_diagnostics=False, attention_diagnostics_recent_window=None): # indices seem to be a leftover from ACT variants, unused in fixed depth models
+    def forward(self, x, pos_emb_closure, cache_context, start_index, indices,collect_attention_diagnostics=False, attention_diagnostics_recent_window=None,repeat_cache_window=None): # indices seem to be a leftover from ACT variants, unused in fixed depth models
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         C = self.n_embd
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -456,8 +549,7 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         diag = None
-        if attention_diagnostics_recent_window is not None:
-            raise ValueError("not yet implemented")
+        
 
         pos_size = k.shape[-1] // 2
 
@@ -488,7 +580,8 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
             self.all_keys = apply_inplace_set(self.all_keys, k, dim=2) # write all heads along the repeat axis, B,H,hs untouched
             self.all_values = apply_inplace_set(self.all_values, v, dim=2)
             k = self.all_keys[1]
-            v = self.all_values[1]            
+            v = self.all_values[1]  
+            print_deb(f"k is {k.shape} v is {v.shape}")          
 
             if self.is_causal:
 
@@ -506,7 +599,11 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
             attn_mask = None
             sdpa_is_causal = self.is_causal
         
-        if self.flash and collect_attention_diagnostics==False:
+        if (
+            self.flash
+            and self.attention_implementation == "sdpa"
+            and collect_attention_diagnostics == False
+        ):
             if att_prefix is not None:
                 raise NotImplementedError
             # efficient attention using Flash Attention CUDA kernels
@@ -520,7 +617,27 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
                         )
         else:
             # manual implementation of attention
+            print_deb("MANUAL ATT")
+            print_deb("MANUAL ATT")
+            print_deb("MANUAL ATT")
+            print_deb("MANUAL ATT")
+            print_deb("MANUAL ATT")
+            num_k = k.shape[2]
+            num_q = q.shape[-1]
+            # print(f"k shape is {num_k} and q shape is {num_q} from inside causal attention else man att")
+            current_reps = num_k // T
+            if repeat_cache_window is not None and repeat_cache_window < current_reps:
+                cutoff = (current_reps-repeat_cache_window) * T
+                excluded_key_mask = torch.zeros((1,1,1,num_k),dtype=torch.bool,device=k.device)
+                excluded_key_mask[..., :cutoff] = True
+                
+
+
+
+
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            if repeat_cache_window is not None and repeat_cache_window < current_reps:
+                att = att.masked_fill(excluded_key_mask,float("-inf"))
             # att = pos_emb_closure.adapt_attention_before_softmax(att, start_query_index=start_index, start_key_index=start_index)
             if attn_mask is None and self.is_causal:
                 attn_mask = self.bias[:,:,:T,:T] == 1
@@ -598,7 +715,7 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self,x,pos_emb_closure,cache_context,start_index,indices=None,collect_attention_diagnostics=False,attention_diagnostics_recent_window=None,):
+    def forward(self,x,pos_emb_closure,cache_context,start_index,indices=None,collect_attention_diagnostics=False,attention_diagnostics_recent_window=None,repeat_cache_window=None):
         attention_output, diagnostics = self.attn(
             self.ln_1(x),
             pos_emb_closure,
@@ -609,6 +726,7 @@ class Block(nn.Module):
             attention_diagnostics_recent_window=(
                 attention_diagnostics_recent_window
             ),
+            repeat_cache_window=(repeat_cache_window),
         )
 
         x = x + attention_output
@@ -690,18 +808,113 @@ class GPTBase(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, get_logits=False, use_cache=False, iter=None, return_all_logits=False,num_repeats=None,return_repeat_states=False,return_attention_diagnostics=False,attention_diagnostics_recent_window=None):
+    def forward(self, idx, targets=None, get_logits=False, use_cache=False, iter=None, return_all_logits=False,num_repeats=None,return_repeat_states=False,return_attention_diagnostics=False,attention_diagnostics_recent_window=None,repeat_cache_window=None,intervention_source_depth=None,intervention_input_ids=None,cache_reset_source_depth=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
         repeats = self.n_repeat if num_repeats is None else int(num_repeats)
         if repeats <= 0:
             raise ValueError("num_repeats must be positive.")
+        has_intervention_depth = intervention_source_depth is not None
+        has_intervention_inputs = intervention_input_ids is not None
+        if has_intervention_depth != has_intervention_inputs:
+            raise ValueError(
+                "intervention_source_depth and intervention_input_ids must be "
+                "supplied together."
+            )
+        if has_intervention_depth:
+            if self.training:
+                raise ValueError(
+                    "Clean-state intervention is only supported in evaluation mode."
+                )
+            if use_cache:
+                raise ValueError(
+                    "Clean-state intervention does not support external LM cache mode."
+                )
+            if isinstance(intervention_source_depth, bool) or not isinstance(
+                intervention_source_depth, int
+            ):
+                raise TypeError("intervention_source_depth must be an integer.")
+            if not 0 <= intervention_source_depth < repeats:
+                raise ValueError(
+                    "intervention_source_depth must be in the range "
+                    "0 .. num_repeats - 1."
+                )
+            if len(self.transformer.h_begin) != 0:
+                raise ValueError(
+                    "Clean-state intervention currently requires n_layer_begin == 0."
+                )
+            if not isinstance(intervention_input_ids, torch.Tensor):
+                raise TypeError("intervention_input_ids must be a torch.Tensor.")
+            if intervention_input_ids.shape != idx.shape:
+                raise ValueError(
+                    "intervention_input_ids must have the same shape as the "
+                    f"original input: expected {tuple(idx.shape)}, got "
+                    f"{tuple(intervention_input_ids.shape)}."
+                )
+            if intervention_input_ids.device != idx.device:
+                raise ValueError(
+                    "intervention_input_ids must be on the same device as the "
+                    "original input."
+                )
+            if intervention_input_ids.dtype != idx.dtype:
+                raise TypeError(
+                    "intervention_input_ids must have the same dtype as the "
+                    "original input."
+                )
+        has_cache_reset = cache_reset_source_depth is not None
+        if has_cache_reset:
+            if self.training:
+                raise ValueError(
+                    "Cache reset is only supported in evaluation mode."
+                )
+            if use_cache:
+                raise ValueError(
+                    "Cache reset does not support external LM cache mode."
+                )
+            if isinstance(cache_reset_source_depth, bool) or not isinstance(
+                cache_reset_source_depth, int
+            ):
+                raise TypeError("cache_reset_source_depth must be an integer.")
+            if not 0 <= cache_reset_source_depth < repeats:
+                raise ValueError(
+                    "cache_reset_source_depth must be in the range "
+                    "0 .. num_repeats - 1."
+                )
+            if (
+                has_intervention_depth
+                and cache_reset_source_depth != intervention_source_depth
+            ):
+                raise ValueError(
+                    "State intervention and cache reset must use the same source depth."
+                )
         if return_attention_diagnostics and self.training:
             raise ValueError(
                 "Attention diagnostics are only supported in evaluation mode."
             )
-
+        if repeat_cache_window is not None:
+            if isinstance(repeat_cache_window, bool) or not isinstance(
+                repeat_cache_window, int
+            ):
+                raise TypeError(
+                    "repeat_cache_window must be a positive integer or None."
+                )
+            if repeat_cache_window <= 0:
+                raise ValueError("repeat_cache_window must be positive.")
+            # if self.training:
+            #     raise ValueError(
+            #         "repeat_cache_window is evaluation-only."
+            #     )
+        if repeat_cache_window is not None or has_cache_reset:
+            if self.config.attention_mode != "bidirectional":
+                raise ValueError(
+                    "repeat_cache_window currently requires bidirectional attention."
+                )
+            if self.config.attention_implementation != "manual":
+                raise ValueError(
+                    "repeat_cache_window currently requires manual attention; "
+                    "the SDPA/Flash path does not apply the repeat-cache mask."
+                )
         
         # forward the GPT model itself
         if use_cache:
@@ -716,6 +929,17 @@ class GPTBase(nn.Module):
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         x = self.transformer.drop(x)
         x = pos_emb_closure.adapt_model_input(x, start_index=index_shift)
+
+        intervention_x = None
+        if has_intervention_depth:
+            # This is the same canonical middle-stack input representation used
+            # for the original row.  For the supported n_layer_begin == 0 case,
+            # no learned begin stack has to be assigned an ambiguous role.
+            intervention_x = self.transformer.wte(intervention_input_ids)
+            intervention_x = self.transformer.drop(intervention_x)
+            intervention_x = pos_emb_closure.adapt_model_input(
+                intervention_x, start_index=index_shift
+            )
        
         for block in self.transformer.h_begin:
             x = block(x, pos_emb_closure, cache_context, start_index=index_shift,)
@@ -735,6 +959,25 @@ class GPTBase(nn.Module):
         sum_active = 0
         try:
             for rep_idx in range(1, repeats + 1):
+                if (
+                    intervention_x is not None
+                    and rep_idx == intervention_source_depth + 1
+                ):
+                    # Replace only the current recurrent representation.  Each
+                    # middle block retains the K/V entries accumulated during
+                    # the free rollout through intervention_source_depth.
+                    x = intervention_x
+                active_repeat_cache_window = repeat_cache_window
+                if has_cache_reset and rep_idx > cache_reset_source_depth:
+                    # Permanently hide the pre-reset segment while allowing a
+                    # new cache history to grow under the baseline window.
+                    # Physical K/V storage and append positions remain intact.
+                    post_reset_repeats = rep_idx - cache_reset_source_depth
+                    active_repeat_cache_window = (
+                        post_reset_repeats
+                        if repeat_cache_window is None
+                        else min(post_reset_repeats, repeat_cache_window)
+                    )
                 for mid_idx, block in enumerate(self.transformer.h_mid):
                     x, diagnostics = block(
                         x,
@@ -747,6 +990,7 @@ class GPTBase(nn.Module):
                         attention_diagnostics_recent_window=(
                             attention_diagnostics_recent_window
                         ),
+                        repeat_cache_window=(active_repeat_cache_window),
                     )
 
                     if diagnostics is not None:

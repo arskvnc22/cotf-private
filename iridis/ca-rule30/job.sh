@@ -31,6 +31,8 @@ SBATCH_BIN="${SBATCH_BIN:-sbatch}"
 
 MODEL="${MODEL:-but_full_depth}"
 ATTENTION_MODE="${ATTENTION_MODE:-bidirectional}"
+ATTENTION_IMPLEMENTATION="${ATTENTION_IMPLEMENTATION:-sdpa}"
+REPEAT_CACHE_WINDOW="${REPEAT_CACHE_WINDOW-4}"
 POSITIONAL_ENCODER="${POSITIONAL_ENCODER:-rotary}"
 N_LAYER="${N_LAYER:-1}"
 # Variable CA pairs override this fallback repeat count during train/evaluation.
@@ -54,29 +56,35 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 OPT="${OPT:-adamw}"
 SCHEDULER="${SCHEDULER:-none}"
 LR="${LR:-1e-3}"
-WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.15}"
 GRAD_CLIP="${GRAD_CLIP:-0.9}"
 DROPOUT="${DROPOUT:-0.0}"
 # Model initialization and training-row generation use independent defaults.
 # Holding DATA_SEED fixed while sweeping SEED isolates initialization variance.
-SEED="${SEED:-0}"
+# The above statement is strictly true whn no dropout and no meaningful training time global randomness
+SEED="${SEED:-1}"
 DATA_SEED="${DATA_SEED:-1}"
 SHUFFLE_SEED="${SHUFFLE_SEED:-1}"
 
-CA_TRAIN_PAIRS="${CA_TRAIN_PAIRS:-1:1 2:2 3:3}"
+CA_TRAIN_PAIRS="${CA_TRAIN_PAIRS:-1:1 2:2 3:3 4:4 5:5 6:6 7:7 8:8 9:9 10:10 11:11 12:12}"
 # Empty values let ca_main.py derive the largest configured pair.
 BEST_PAIR="${BEST_PAIR-}"
-CA_EXTRAPOLATION_VAL_PAIRS="${CA_EXTRAPOLATION_VAL_PAIRS-4:4 5:5}"
+# The default protocol validates one, two, and three updates beyond training.
+# ca_main.py derives 7:7 as the selection pair from this ordered coverage.
+CA_EXTRAPOLATION_VAL_PAIRS="${CA_EXTRAPOLATION_VAL_PAIRS-13:13 14:14 15:15}"
 EXTRAPOLATION_BEST_PAIR="${EXTRAPOLATION_BEST_PAIR-}"
 STRICT_MIN_ID_CELL_ACCURACY="${STRICT_MIN_ID_CELL_ACCURACY:-0.99}"
 STRICT_MIN_ID_EXACT_ACCURACY="${STRICT_MIN_ID_EXACT_ACCURACY:-0.95}"
-CA_FINAL_EVAL_PAIRS="${CA_FINAL_EVAL_PAIRS-8:8}"
-DIAGNOSTIC_MAX_REPEATS="${DIAGNOSTIC_MAX_REPEATS:-8}"
+# The final repeat-horizon diagnostic already measures every diagonal through
+# 10:10 on held-out rows, so direct internal-pair evaluation defaults to none.
+CA_FINAL_EVAL_PAIRS="${CA_FINAL_EVAL_PAIRS-}"
+DIAGNOSTIC_MAX_REPEATS="${DIAGNOSTIC_MAX_REPEATS:-20}"
 DIAGNOSTIC_EXAMPLES="${DIAGNOSTIC_EXAMPLES:-1}"
 
 # Parse values that affect shell-side naming/reporting. The complete argument
 # list is still forwarded to Python, where later occurrences take precedence.
 CLI_ARGS=("$@")
+REPEAT_CACHE_WINDOW_FROM_CLI=0
 ARG_INDEX=0
 while [ "$ARG_INDEX" -lt "${#CLI_ARGS[@]}" ]; do
     case "${CLI_ARGS[$ARG_INDEX]}" in
@@ -86,6 +94,15 @@ while [ "$ARG_INDEX" -lt "${#CLI_ARGS[@]}" ]; do
             ;;
         --attention_mode)
             ATTENTION_MODE="${CLI_ARGS[$((ARG_INDEX + 1))]}"
+            ARG_INDEX=$((ARG_INDEX + 2))
+            ;;
+        --attention_implementation)
+            ATTENTION_IMPLEMENTATION="${CLI_ARGS[$((ARG_INDEX + 1))]}"
+            ARG_INDEX=$((ARG_INDEX + 2))
+            ;;
+        --repeat_cache_window|--repeat-cache-window)
+            REPEAT_CACHE_WINDOW="${CLI_ARGS[$((ARG_INDEX + 1))]}"
+            REPEAT_CACHE_WINDOW_FROM_CLI=1
             ARG_INDEX=$((ARG_INDEX + 2))
             ;;
         --positional_encoder)
@@ -215,11 +232,55 @@ while [ "$ARG_INDEX" -lt "${#CLI_ARGS[@]}" ]; do
     esac
 done
 
+CACHE_POLICY_LABEL="cache_full"
+CACHE_NAME_SEGMENT=""
+REPEAT_CACHE_WINDOW_CLI=()
+if [ -n "$REPEAT_CACHE_WINDOW" ]; then
+    if ! [[ "$REPEAT_CACHE_WINDOW" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: REPEAT_CACHE_WINDOW must be a positive integer; got '$REPEAT_CACHE_WINDOW'." >&2
+        exit 2
+    fi
+    if [ "$MODEL" != "ca_cotf_cache_attn" ]; then
+        echo "ERROR: repeat-cache interventions require MODEL=ca_cotf_cache_attn." >&2
+        exit 2
+    fi
+    if [ "$ATTENTION_MODE" != "bidirectional" ]; then
+        echo "ERROR: repeat-cache interventions require ATTENTION_MODE=bidirectional." >&2
+        exit 2
+    fi
+    if [ "$ATTENTION_IMPLEMENTATION" != "manual" ]; then
+        echo "ERROR: repeat-cache interventions require ATTENTION_IMPLEMENTATION=manual." >&2
+        exit 2
+    fi
+
+    CACHE_POLICY_LABEL="cache_recent_${REPEAT_CACHE_WINDOW}"
+    CACHE_NAME_SEGMENT="_${CACHE_POLICY_LABEL}"
+    if [ "$REPEAT_CACHE_WINDOW_FROM_CLI" -eq 0 ]; then
+        REPEAT_CACHE_WINDOW_CLI=(
+            --repeat_cache_window
+            "$REPEAT_CACHE_WINDOW"
+        )
+    fi
+
+    TRAINING_USES_MASK=0
+    for TRAIN_PAIR in $CA_TRAIN_PAIRS; do
+        TRAIN_PAIR_REPEATS="${TRAIN_PAIR#*:}"
+        if [[ "$TRAIN_PAIR_REPEATS" =~ ^[1-9][0-9]*$ ]] \
+            && [ "$TRAIN_PAIR_REPEATS" -gt "$REPEAT_CACHE_WINDOW" ]; then
+            TRAINING_USES_MASK=1
+            break
+        fi
+    done
+    if [ "$TRAINING_USES_MASK" -eq 0 ]; then
+        echo "WARNING: all configured training repeats are <= REPEAT_CACHE_WINDOW=$REPEAT_CACHE_WINDOW; the cache mask will not alter training forwards at those depths." >&2
+    fi
+fi
+
 MODEL_RUN_NAME="${MODEL_RUN_NAME:-$MODEL}"
 MODEL_TAG="${MODEL//[^a-zA-Z0-9_-]/_}"
 TRAIN_PAIR_TAG="${CA_TRAIN_PAIRS//:/x}"
 TRAIN_PAIR_TAG="${TRAIN_PAIR_TAG// /_}"
-EXP_NAME="${EXP_NAME:-ca30_${MODEL_TAG}_embd_${N_EMBD}_beg_${N_LAYER_BEGIN}_mid_${N_LAYER}x${N_REPEAT}_end_${N_LAYER_END}_pairs_${TRAIN_PAIR_TAG}_opt_${OPT}_lr_${LR}_wd_${WEIGHT_DECAY}_gc_${GRAD_CLIP}_mseed_${SEED}_dseed_${DATA_SEED}}"
+EXP_NAME="${EXP_NAME:-ca30_bi__${MODEL_TAG}_${ATTENTION_IMPLEMENTATION}${CACHE_NAME_SEGMENT}_embd_${N_EMBD}_beg_${N_LAYER_BEGIN}_mid_${N_LAYER}x${N_REPEAT}_end_${N_LAYER_END}_pairs_${TRAIN_PAIR_TAG}_opt_${OPT}_lr_${LR}_wd_${WEIGHT_DECAY}_gc_${GRAD_CLIP}_mseed_${SEED}_dseed_${DATA_SEED}}"
 
 read -r -a TRAIN_PAIR_ARGS <<< "$CA_TRAIN_PAIRS"
 read -r -a EXTRAPOLATION_PAIR_ARGS <<< "$CA_EXTRAPOLATION_VAL_PAIRS"
@@ -293,6 +354,8 @@ if [ -z "$SLURM_JOB_ID" ]; then
     echo "  Model:            $MODEL"
     echo "  Run directory:    $RUN_DIR"
     echo "  Attention:        $ATTENTION_MODE"
+    echo "  Attention impl:   $ATTENTION_IMPLEMENTATION"
+    echo "  Cache policy:     $CACHE_POLICY_LABEL"
     echo "  Positional enc:   $POSITIONAL_ENCODER"
     echo "  Train pairs:      $CA_TRAIN_PAIRS"
     echo "  Extrap val pairs: ${CA_EXTRAPOLATION_VAL_PAIRS:-none}"
@@ -358,6 +421,8 @@ echo " GPUs:             $N_GPUS"
 echo " Job ID:           $SLURM_JOB_ID"
 echo " Model:            $MODEL"
 echo " Attention:        $ATTENTION_MODE"
+echo " Attention impl:   $ATTENTION_IMPLEMENTATION"
+echo " Cache policy:     $CACHE_POLICY_LABEL"
 echo " Positional enc:   $POSITIONAL_ENCODER"
 echo " Architecture:     ${N_LAYER}L, fallback repeats=$N_REPEAT"
 echo " Width:            d=$N_EMBD h=$N_HEAD"
@@ -398,6 +463,7 @@ TRAIN_ARGS=(
     --config_format base
     --model "$MODEL"
     --attention_mode "$ATTENTION_MODE"
+    --attention_implementation "$ATTENTION_IMPLEMENTATION"
     --positional_encoder "$POSITIONAL_ENCODER"
     --n_embd "$N_EMBD"
     --n_head "$N_HEAD"
@@ -449,6 +515,7 @@ TRAIN_ARGS=(
     --ca_best_metric exact_sequence_accuracy
     --ca_save_every "$ITERATIONS"
     --ca_log_every 25
+    "${REPEAT_CACHE_WINDOW_CLI[@]}"
     "$@"
 )
 

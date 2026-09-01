@@ -5,6 +5,7 @@
 !docs/plan.md
 !docs/reprod-notes.md
 !docs/extend-notes.md
+!iridis/ca-rule30/README.md
 
 # Dataset folder
 data/datasets/
@@ -27,6 +28,17 @@ __pycache__/
 
 # Reference PDFs (paper, etc.)
 refs/
+
+# Huge att diagnositcs
+ca-attention-diagnostics/
+
+# intervention results lot of pngs
+
+downloads/
+
+# run artifcats
+iridis/ca-rule30/runs/
+
 
 # Distribution / packaging
 .Python
@@ -156,3 +168,12 @@ dmypy.json
 # Slurm files
 slurm_*.out
 slurm_*.err
+gpu_test_*.out
+gpu_test_*.err
+*.aux
+*.blg
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.run.xml
+

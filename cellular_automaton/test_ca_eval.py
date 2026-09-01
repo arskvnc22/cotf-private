@@ -1,12 +1,17 @@
 import math
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from cellular_automaton.ca_eval import (
+    _forward_all_cells,
+    evaluate_ca_clean_state_transition_lengths,
+    evaluate_ca_clean_state_transitions,
     evaluate_ca_pairs,
     evaluate_ca_model,
+    evaluate_loaded_ca_checkpoint,
     evaluate_ca_repeat_horizon_diagnostics,
     finalize_ca_metrics,
     format_ca_repeat_examples,
@@ -14,11 +19,19 @@ from cellular_automaton.ca_eval import (
     run_final_ca_evaluation,
     update_ca_counters,
 )
+from cellular_automaton.ca_forward import CAForwardContext, CAForwardPolicy
 from cellular_automaton.ca_gen import Rule30Dataset, apply_rule30, rule30
 
 
 def logits_for_predictions(predictions):
     return F.one_hot(predictions, num_classes=2).float()
+
+
+def forward_context(model, *, repeat_cache_window=None):
+    return CAForwardContext(
+        model,
+        CAForwardPolicy(repeat_cache_window=repeat_cache_window),
+    )
 
 
 def test_counter_metrics_for_one_known_error():
@@ -63,7 +76,9 @@ def test_evaluate_ca_model_with_oracle_and_restores_training_mode():
     model = Rule30Oracle()
     model.train()
 
-    metrics = evaluate_ca_model(model, dataloader, device="cpu")
+    metrics = evaluate_ca_model(
+        forward_context(model), dataloader, device="cpu"
+    )
 
     assert model.training
     assert metrics["num_batches"] == 3
@@ -105,12 +120,253 @@ class LanguageModelStyleOracle(torch.nn.Module):
         return {"logits": logits if get_logits else None, "loss": None}
 
 
+_ARGUMENT_OMITTED = object()
+
+
+class WindowRecordingOracle(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.received_windows = []
+        self.interventions = []
+
+    def forward(
+        self,
+        inputs,
+        targets=None,
+        get_logits=False,
+        return_all_logits=False,
+        num_repeats=1,
+        return_repeat_states=False,
+        repeat_cache_window=_ARGUMENT_OMITTED,
+        intervention_source_depth=None,
+        intervention_input_ids=None,
+    ):
+        self.received_windows.append(repeat_cache_window)
+        self.interventions.append(
+            (intervention_source_depth, intervention_input_ids)
+        )
+        if intervention_source_depth is None:
+            state = apply_rule30(inputs, steps=num_repeats)
+        else:
+            state = rule30(intervention_input_ids)
+        logits = logits_for_predictions(state) * 20.0
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, 2), targets.view(-1))
+        result = {
+            "logits": logits if get_logits else None,
+            "loss": loss,
+            "average_depth": torch.as_tensor(num_repeats),
+        }
+        if return_repeat_states:
+            result["repeat_states"] = [
+                F.one_hot(
+                    inputs if repeat == 0 else apply_rule30(inputs, steps=repeat),
+                    num_classes=2,
+                ).float()
+                for repeat in range(num_repeats + 1)
+            ]
+        return result
+
+
+class PreservedCacheRecordingOracle(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inputs = []
+        self.repeat_counts = []
+        self.source_depths = []
+        self.intervention_inputs = []
+
+    def forward(
+        self,
+        inputs,
+        get_logits=False,
+        return_all_logits=False,
+        num_repeats=1,
+        intervention_source_depth=None,
+        intervention_input_ids=None,
+    ):
+        self.inputs.append(inputs.detach().cpu().clone())
+        self.repeat_counts.append(num_repeats)
+        self.source_depths.append(intervention_source_depth)
+        self.intervention_inputs.append(
+            intervention_input_ids.detach().cpu().clone()
+        )
+        logits = logits_for_predictions(rule30(intervention_input_ids)) * 20.0
+        return {
+            "logits": logits if get_logits else None,
+            "average_depth": torch.as_tensor(num_repeats),
+        }
+
+
+class RetryRecordingOracle(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def forward(self, inputs, **kwargs):
+        self.calls.append(dict(kwargs))
+        if "return_all_logits" in kwargs:
+            raise TypeError("unexpected keyword argument 'return_all_logits'")
+        predictions = rule30(inputs)
+        logits = logits_for_predictions(predictions) * 20.0
+        if "targets" not in kwargs:
+            logits = logits[:, -1:, :]
+        return {
+            "logits": logits if kwargs.get("get_logits") else None,
+            "loss": None,
+        }
+
+
+def test_forward_policy_is_applied_and_full_cache_argument_is_omitted():
+    dataset = Rule30Dataset(num_samples=2, num_cells=8, seed=51)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=False)
+
+    full_model = WindowRecordingOracle()
+    evaluate_ca_model(forward_context(full_model), dataloader, device="cpu")
+    assert full_model.received_windows == [_ARGUMENT_OMITTED]
+
+    recent_model = WindowRecordingOracle()
+    evaluate_ca_model(
+        forward_context(recent_model, repeat_cache_window=4),
+        dataloader,
+        device="cpu",
+    )
+    assert recent_model.received_windows == [4]
+
+
+def test_all_position_compatibility_retries_keep_the_forward_policy():
+    model = RetryRecordingOracle()
+    inputs = torch.tensor([[0, 0, 1, 0, 0, 0, 0, 0]])
+
+    logits, _ = _forward_all_cells(
+        forward_context(model, repeat_cache_window=4), inputs
+    )
+
+    assert logits.shape == (1, 8, 2)
+    assert len(model.calls) == 3
+    assert all(call["repeat_cache_window"] == 4 for call in model.calls)
+
+
+def test_recent_policy_reaches_repeat_diagnostics_and_external_rollouts():
+    dataset = Rule30Dataset(num_samples=2, num_cells=8, seed=52)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=False)
+    eval_loaders = {8: dataloader}
+    model = WindowRecordingOracle()
+    context = forward_context(model, repeat_cache_window=4)
+
+    evaluate_ca_repeat_horizon_diagnostics(
+        context,
+        dataloader,
+        device="cpu",
+        max_repeats=2,
+        target_horizons=range(3),
+        num_examples=0,
+    )
+    assert model.received_windows
+    assert all(window == 4 for window in model.received_windows)
+
+    model.received_windows.clear()
+    run_final_ca_evaluation(
+        context,
+        eval_loaders,
+        device="cpu",
+        trained_ca_steps=1,
+        trained_num_repeats=1,
+        external_ca_steps=[3],
+    )
+    assert len(model.received_windows) == 4
+    assert all(window == 4 for window in model.received_windows)
+
+    model.received_windows.clear()
+    evaluate_ca_clean_state_transition_lengths(
+        context,
+        eval_loaders,
+        device="cpu",
+        max_transition_depth=2,
+    )
+    assert len(model.received_windows) == 2
+    assert all(window == 4 for window in model.received_windows)
+
+
+def test_clean_state_probe_preserves_rollout_origin_and_injects_exact_rows():
+    input_row = torch.tensor([0, 0, 0, 1, 0, 0, 0, 0])
+    dataloader = DataLoader(
+        [{"input_id": input_row}],
+        batch_size=1,
+        shuffle=False,
+    )
+    model = PreservedCacheRecordingOracle()
+    model.train()
+
+    diagnostics = evaluate_ca_clean_state_transitions(
+        forward_context(model),
+        dataloader,
+        device="cpu",
+        max_transition_depth=3,
+    )
+
+    initial_state = input_row.unsqueeze(0)
+    expected_states = [initial_state]
+    for _ in range(2):
+        expected_states.append(rule30(expected_states[-1]))
+    assert model.training
+    assert model.repeat_counts == [1, 2, 3]
+    assert model.source_depths == [0, 1, 2]
+    assert all(torch.equal(actual, initial_state) for actual in model.inputs)
+    assert all(
+        torch.equal(actual, expected)
+        for actual, expected in zip(model.intervention_inputs, expected_states)
+    )
+    assert diagnostics["max_transition_depth"] == 3
+    assert diagnostics["num_batches"] == 1
+    final_transition = diagnostics["transitions"]["steps_2_to_3"]
+    assert final_transition["source_ca_steps"] == 2
+    assert final_transition["target_ca_steps"] == 3
+    assert final_transition["num_repeats"] == 3
+    assert final_transition["intervention_source_depth"] == 2
+
+
+def test_clean_state_probe_oracle_respects_batch_limit_and_empty_loader():
+    dataset = Rule30Dataset(num_samples=5, num_cells=12, seed=61)
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=False)
+
+    diagnostics = evaluate_ca_clean_state_transitions(
+        forward_context(DiagnosticRule30Oracle()),
+        dataloader,
+        device="cpu",
+        max_transition_depth=4,
+        max_batches=2,
+    )
+
+    for transition in diagnostics["transitions"].values():
+        metrics = transition["metrics"]
+        assert metrics["num_batches"] == 2
+        assert metrics["total_sequences"] == 4
+        assert metrics["cell_accuracy"] == 1.0
+        assert metrics["exact_sequence_accuracy"] == 1.0
+    for target_depth, transition in enumerate(
+        diagnostics["transitions"].values(), start=1
+    ):
+        metrics = transition["metrics"]
+        assert metrics["average_depth"] == float(target_depth)
+
+    empty_loader = DataLoader([], batch_size=1)
+    with pytest.raises(ValueError, match="consumed no batches"):
+        evaluate_ca_clean_state_transitions(
+            forward_context(DiagnosticRule30Oracle()),
+            empty_loader,
+            device="cpu",
+            max_transition_depth=1,
+        )
+
+
 def test_final_evaluation_requests_all_logits_from_language_model_interface():
     dataset = Rule30Dataset(num_samples=3, num_cells=8, seed=17)
     eval_loaders = {8: DataLoader(dataset, batch_size=2, shuffle=False)}
 
     results = run_final_ca_evaluation(
-        LanguageModelStyleOracle(),
+        forward_context(LanguageModelStyleOracle()),
         eval_loaders,
         device="cpu",
         trained_ca_steps=1,
@@ -126,7 +382,7 @@ def test_final_evaluation_internal_and_external_extrapolation():
     model = IterativeRule30Oracle(default_repeats=1)
 
     results = run_final_ca_evaluation(
-        model,
+        forward_context(model),
         eval_loaders,
         device="cpu",
         trained_ca_steps=1,
@@ -155,7 +411,7 @@ def test_variable_training_pairs_are_evaluated_separately():
     model = IterativeRule30Oracle(default_repeats=1)
 
     metrics = evaluate_ca_pairs(
-        model,
+        forward_context(model),
         eval_loaders,
         device="cpu",
         pairs=[(1, 1), (2, 2)],
@@ -168,7 +424,7 @@ def test_variable_training_pairs_are_evaluated_separately():
     ] == 1.0
 
     final = run_final_ca_evaluation(
-        model,
+        forward_context(model),
         eval_loaders,
         device="cpu",
         trained_ca_steps=2,
@@ -191,7 +447,7 @@ def test_external_rollout_accounts_for_steps_learned_per_model_call():
     model = IterativeRule30Oracle(default_repeats=2)
 
     results = run_final_ca_evaluation(
-        model,
+        forward_context(model),
         eval_loaders,
         device="cpu",
         trained_ca_steps=2,
@@ -213,12 +469,17 @@ class DiagnosticRule30Oracle(torch.nn.Module):
         return_all_logits=False,
         num_repeats=1,
         return_repeat_states=False,
+        intervention_source_depth=None,
+        intervention_input_ids=None,
     ):
         state = inputs
         repeat_states = [F.one_hot(state, num_classes=2).float()]
-        for _ in range(num_repeats):
-            state = rule30(state)
-            repeat_states.append(F.one_hot(state, num_classes=2).float())
+        if intervention_source_depth is None:
+            for _ in range(num_repeats):
+                state = rule30(state)
+                repeat_states.append(F.one_hot(state, num_classes=2).float())
+        else:
+            state = rule30(intervention_input_ids)
         logits = logits_for_predictions(state) * 20.0
         result = {
             "logits": logits if get_logits else None,
@@ -247,7 +508,7 @@ def test_literal_example_metrics_distinguish_the_three_comparisons():
     )
 
     diagnostics = evaluate_ca_repeat_horizon_diagnostics(
-        IdentityDiagnosticModel(),
+        forward_context(IdentityDiagnosticModel()),
         dataloader,
         device="cpu",
         max_repeats=2,
@@ -274,7 +535,7 @@ def test_repeat_horizon_matrix_recurrence_hidden_states_and_literal_rows():
     dataloader = DataLoader(dataset, batch_size=3, shuffle=False)
 
     diagnostics = evaluate_ca_repeat_horizon_diagnostics(
-        DiagnosticRule30Oracle(),
+        forward_context(DiagnosticRule30Oracle()),
         dataloader,
         device="cpu",
         max_repeats=4,
@@ -334,12 +595,67 @@ def test_repeat_horizon_matrix_recurrence_hidden_states_and_literal_rows():
     ) in rendered
 
 
+def test_loaded_checkpoint_evaluation_skips_unsupported_clean_state_probe(capsys):
+    dataset = Rule30Dataset(num_samples=4, num_cells=8, seed=71)
+    eval_loaders = {8: DataLoader(dataset, batch_size=2, shuffle=False)}
+    result = evaluate_loaded_ca_checkpoint(
+        forward_context(IterativeRule30Oracle()),
+        eval_loaders,
+        device="cpu",
+        checkpoint_metadata={"step": 10},
+        label="best_id",
+        split_seed=200,
+        samples_per_length=4,
+        trained_ca_steps=1,
+        trained_num_repeats=1,
+        repeat_diagnostic_max_repeats=2,
+        repeat_diagnostic_horizons=range(3),
+        repeat_diagnostic_examples=0,
+        forward_policy_metadata={"repeat_cache_policy": "full"},
+    )
+
+    assert result["checkpoint"] == {"step": 10}
+    assert result["split"] == {
+        "role": "independent_final_test",
+        "seed": 200,
+        "samples_per_length": 4,
+    }
+    assert result["repeat_diagnostics"]["8"]["max_repeats"] == 2
+    assert result["preserved_cache_clean_state_transitions"] is None
+    assert "Skipping preserved-cache clean-state transitions" in capsys.readouterr().out
+
+
+def test_loaded_checkpoint_evaluation_runs_supported_clean_state_probe():
+    dataset = Rule30Dataset(num_samples=4, num_cells=8, seed=72)
+    eval_loaders = {8: DataLoader(dataset, batch_size=2, shuffle=False)}
+    result = evaluate_loaded_ca_checkpoint(
+        forward_context(DiagnosticRule30Oracle()),
+        eval_loaders,
+        device="cpu",
+        checkpoint_metadata={"step": 20},
+        label="best_extrapolation_strict",
+        split_seed=201,
+        samples_per_length=4,
+        trained_ca_steps=1,
+        trained_num_repeats=1,
+        repeat_diagnostic_max_repeats=2,
+        repeat_diagnostic_horizons=range(3),
+        repeat_diagnostic_examples=0,
+    )
+
+    clean = result["preserved_cache_clean_state_transitions"]
+    assert clean["8"]["max_transition_depth"] == 2
+    assert clean["8"]["transitions"]["steps_1_to_2"]["metrics"][
+        "cell_accuracy"
+    ] == 1.0
+
+
 def test_literal_rows_mark_an_unconfigured_expected_horizon():
     dataset = Rule30Dataset(num_samples=2, num_cells=8, seed=41)
     dataloader = DataLoader(dataset, batch_size=2, shuffle=False)
 
     diagnostics = evaluate_ca_repeat_horizon_diagnostics(
-        DiagnosticRule30Oracle(),
+        forward_context(DiagnosticRule30Oracle()),
         dataloader,
         device="cpu",
         max_repeats=2,

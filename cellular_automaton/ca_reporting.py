@@ -17,6 +17,11 @@ from numbers import Real
 from pathlib import Path
 from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 
+try:
+    from .ca_forward import CAForwardPolicy
+except ImportError:
+    from ca_forward import CAForwardPolicy
+
 
 SCHEMA_VERSION = 1
 MANIFEST_FILENAME = "run_manifest.json"
@@ -113,6 +118,27 @@ def _selected_arguments(
     return {name: _argument(args, name) for name in names if name in args}
 
 
+def forward_policy_metadata(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Return normalized policy metadata, including for historical manifests."""
+
+    stored_policy = manifest.get("forward_policy")
+    if (
+        isinstance(stored_policy, Mapping)
+        and "repeat_cache_window" in stored_policy
+    ):
+        repeat_cache_window = stored_policy.get("repeat_cache_window")
+    else:
+        resolved_args = manifest.get("resolved_args", {})
+        repeat_cache_window = (
+            resolved_args.get("repeat_cache_window")
+            if isinstance(resolved_args, Mapping)
+            else None
+        )
+    return CAForwardPolicy(
+        repeat_cache_window=repeat_cache_window
+    ).metadata()
+
+
 def build_run_manifest(
     resolved_args: Mapping[str, Any],
     run_dir: Path | str,
@@ -137,6 +163,7 @@ def build_run_manifest(
         "n_embd",
         "sequence_length",
         "attention_mode",
+        "attention_implementation",
         "positional_encoder",
         "n_layer_begin",
         "n_layer_end",
@@ -212,6 +239,9 @@ def build_run_manifest(
         "ca_val_seed",
         "ca_test_seed",
     )
+    forward_policy = CAForwardPolicy(
+        repeat_cache_window=_argument(resolved_args, "repeat_cache_window")
+    )
 
     manifest: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -221,6 +251,7 @@ def build_run_manifest(
             "tags": list(_argument(resolved_args, "ca_tags", []) or []),
             "note": _argument(resolved_args, "ca_note"),
         },
+        "forward_policy": forward_policy.metadata(),
         "model": _selected_arguments(resolved_args, model_fields),
         "training": {
             **_selected_arguments(resolved_args, training_fields),
@@ -332,9 +363,13 @@ def _base_record(
     repeat_from: int | None = None,
     repeat_to: int | None = None,
 ) -> dict[str, Any]:
+    policy = forward_policy_metadata(manifest)
     return {
         "schema_version": SCHEMA_VERSION,
         "run_id": manifest["run_id"],
+        "repeat_cache_policy": policy["repeat_cache_policy"],
+        "repeat_cache_window": policy["repeat_cache_window"],
+        "forward_policy_label": policy["forward_policy_label"],
         "step": step,
         "data_split": data_split,
         "evaluation_role": evaluation_role,
@@ -640,6 +675,42 @@ def _append_repeat_diagnostics(
                     )
 
 
+def _append_clean_state_transitions(
+    records: list[dict[str, Any]],
+    manifest: Mapping[str, Any],
+    diagnostics: Any,
+    *,
+    step: int | None,
+    data_split: str,
+    checkpoint_type: str | None = None,
+) -> None:
+    """Normalize preserved-cache clean-current transition metrics."""
+    if not isinstance(diagnostics, Mapping):
+        return
+    for length, length_data in diagnostics.items():
+        if not isinstance(length_data, Mapping):
+            continue
+        for transition in length_data.get("transitions", {}).values():
+            if not isinstance(transition, Mapping):
+                continue
+            source_depth = int(transition["source_ca_steps"])
+            target_depth = int(transition["target_ca_steps"])
+            _append_metrics(
+                records,
+                manifest,
+                transition.get("metrics", {}),
+                step=step,
+                data_split=data_split,
+                evaluation_role="preserved_cache_clean_state_transition",
+                checkpoint_type=checkpoint_type,
+                length=int(length),
+                ca_steps=target_depth,
+                num_repeats=int(transition["num_repeats"]),
+                repeat_from=source_depth,
+                repeat_to=target_depth,
+            )
+
+
 def _append_training_exposure(
     records: list[dict[str, Any]],
     manifest: Mapping[str, Any],
@@ -797,9 +868,18 @@ def normalize_training_stats(
             data_split="final_test",
             checkpoint_type=checkpoint_type,
         )
+        _append_clean_state_transitions(
+            records,
+            manifest,
+            analysis.get("preserved_cache_clean_state_transitions", {}),
+            step=step,
+            data_split="final_test",
+            checkpoint_type=checkpoint_type,
+        )
 
     sort_fields = (
         "run_id",
+        "forward_policy_label",
         "data_split",
         "checkpoint_type",
         "step",

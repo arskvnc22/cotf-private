@@ -1,14 +1,50 @@
+import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from cellular_automaton.ca_train import (
+    _set_and_validate_forward_policy,
     ca_selection_key,
     extrapolation_checkpoint_eligible,
     extrapolation_checkpoint_updates,
     training_pair_for_step,
+    _supports_clean_state_intervention,
 )
+from cellular_automaton.ca_forward import CAForwardPolicy
 from optim.runner_utils import InfiniteBatchIterator
 
+
+class _BasicRecurrentModel:
+    def forward(self, inputs, *, num_repeats=None):
+        return inputs, num_repeats
+
+
+class _CleanStateInterventionModel:
+    def forward(
+        self,
+        inputs,
+        *,
+        num_repeats=None,
+        intervention_source_depth=None,
+        intervention_input_ids=None,
+    ):
+        return (
+            inputs,
+            num_repeats,
+            intervention_source_depth,
+            intervention_input_ids,
+        )
+
+
+class _PartialInterventionModel:
+    def forward(self, inputs, *, intervention_source_depth=None):
+        return inputs, intervention_source_depth
+
+
+def test_clean_state_probe_requires_both_explicit_intervention_arguments():
+    assert not _supports_clean_state_intervention(_BasicRecurrentModel())
+    assert not _supports_clean_state_intervention(_PartialInterventionModel())
+    assert _supports_clean_state_intervention(_CleanStateInterventionModel())
 
 def test_ca_best_key_uses_cell_accuracy_and_loss_as_tiebreakers():
     first = {
@@ -117,3 +153,41 @@ def test_variable_training_pairs_are_round_robin_and_resume_stable():
         (1, 1),
     ]
     assert training_pair_for_step([], 10) is None
+
+
+def test_fresh_run_records_its_requested_forward_policy():
+    stats = {}
+    recent_policy = CAForwardPolicy(repeat_cache_window=4).metadata()
+
+    _set_and_validate_forward_policy(stats, recent_policy, start_step=0)
+
+    assert stats["forward_policy"] == recent_policy
+
+
+def test_missing_historical_forward_policy_means_full_cache():
+    stats = {}
+    full_policy = CAForwardPolicy().metadata()
+
+    _set_and_validate_forward_policy(stats, full_policy, start_step=10)
+
+    assert stats["forward_policy"] == full_policy
+
+
+def test_resume_accepts_the_same_forward_policy():
+    recent_policy = CAForwardPolicy(repeat_cache_window=4).metadata()
+    stats = {"forward_policy": recent_policy}
+
+    _set_and_validate_forward_policy(stats, recent_policy, start_step=10)
+
+    assert stats["forward_policy"] == recent_policy
+
+
+def test_resume_rejects_a_policy_change_and_preserves_stored_metadata():
+    full_policy = CAForwardPolicy().metadata()
+    recent_policy = CAForwardPolicy(repeat_cache_window=4).metadata()
+    stats = {"forward_policy": full_policy}
+
+    with pytest.raises(ValueError, match="different forward policy"):
+        _set_and_validate_forward_policy(stats, recent_policy, start_step=10)
+
+    assert stats["forward_policy"] == full_policy

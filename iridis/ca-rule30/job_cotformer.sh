@@ -14,7 +14,7 @@ set -e
 PACKAGE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 PRESET_ARGS=(
-    --model "${MODEL:-fixed_cot_attn}"
+    --model "${MODEL:-ca_cotf}"
     --attention_mode "${ATTENTION_MODE:-bidirectional}"
     --positional_encoder "${POSITIONAL_ENCODER:-rotary}"
 )

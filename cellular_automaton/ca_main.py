@@ -95,6 +95,19 @@ def get_args():
         default="base",
         choices=config.registered_formats(),
     )
+    def positive_int(value):
+        parsed = int(value)
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("Expected a positive integer.")
+        return parsed
+    parser.add_argument(
+        "--repeat_cache_window",
+        "--repeat-cache-window",
+        dest="repeat_cache_window",
+        type=positive_int,
+        default=None,
+
+    )
 
     # Task shape.  Training length is separate from sequence_length because
     # sequence_length is the largest row the model can accept, while training
@@ -111,6 +124,15 @@ def get_args():
         type=int,
         default=1,
         help="Number of Rule 30 updates between each input row and target row.",
+    )
+    parser.add_argument(
+        "--attention_implementation",
+        choices=("sdpa", "manual"),
+        default="sdpa",
+        help=(
+            "Attention backend used by models that support an explicit choice. "
+            "Manual attention remains separate from diagnostic collection."
+        ),
     )
     parser.add_argument(
         "--ca_train_pairs",
@@ -382,6 +404,39 @@ def make_loader(
     )
 
 
+def make_ca_fixed_loaders(args, *, base_seed, num_samples):
+    """Build deterministic validation/test loaders from resolved CA arguments."""
+    pin_memory = args.device.type == "cuda"
+    dataset_class = (
+        MaterializedRule30Dataset
+        if args.ca_data_mode == "materialized"
+        else Rule30Dataset
+    )
+    batch_size = args.ca_eval_batch_size or args.batch_size
+    loaders = {}
+    for num_cells in args.ca_eval_num_cells:
+        # Including the length in the split seed keeps lengths deterministic
+        # without making their rows prefixes of one another.
+        split_seed = int(base_seed) + int(num_cells)
+        dataset = dataset_class(
+            num_samples=num_samples,
+            num_cells=num_cells,
+            steps=args.ca_steps,
+            bernoulli_p=args.ca_bernoulli_p,
+            seed=split_seed,
+        )
+        loaders[num_cells] = make_loader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            seed=split_seed,
+            num_workers=args.ca_num_workers,
+            pin_memory=pin_memory,
+            distributed=False,
+        )
+    return loaders
+
+
 def make_ca_dataloaders(args, distributed_backend):
     """Build training, fixed validation, and independent final-test loaders."""
     train_data_seed = int(args.data_seed)
@@ -410,34 +465,16 @@ def make_ca_dataloaders(args, distributed_backend):
         distributed=True,
     )
 
-    eval_batch_size = args.ca_eval_batch_size or args.batch_size
-
-    def build_fixed_loaders(base_seed, num_samples):
-        loaders = {}
-        for num_cells in args.ca_eval_num_cells:
-            # Including the length in the split seed keeps lengths deterministic
-            # without making their rows prefixes of one another.
-            split_seed = int(base_seed) + int(num_cells)
-            dataset = dataset_class(
-                num_samples=num_samples,
-                num_cells=num_cells,
-                steps=args.ca_steps,
-                bernoulli_p=args.ca_bernoulli_p,
-                seed=split_seed,
-            )
-            loaders[num_cells] = make_loader(
-                dataset,
-                batch_size=eval_batch_size,
-                shuffle=False,
-                seed=split_seed,
-                num_workers=args.ca_num_workers,
-                pin_memory=pin_memory,
-                distributed=False,
-            )
-        return loaders
-
-    eval_loaders = build_fixed_loaders(args.ca_val_seed, args.ca_val_samples)
-    test_loaders = build_fixed_loaders(args.ca_test_seed, args.ca_test_samples)
+    eval_loaders = make_ca_fixed_loaders(
+        args,
+        base_seed=args.ca_val_seed,
+        num_samples=args.ca_val_samples,
+    )
+    test_loaders = make_ca_fixed_loaders(
+        args,
+        base_seed=args.ca_test_seed,
+        num_samples=args.ca_test_samples,
+    )
 
     print_master(
         distributed_backend,

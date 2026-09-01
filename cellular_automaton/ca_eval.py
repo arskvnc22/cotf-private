@@ -8,8 +8,10 @@ import torch
 import torch.nn.functional as F
 
 try:
+    from .ca_forward import CAForwardContext
     from .ca_gen import apply_rule30, rule30
 except ImportError:
+    from ca_forward import CAForwardContext
     from ca_gen import apply_rule30, rule30
 
 
@@ -187,8 +189,16 @@ def finalize_ca_metrics(counters):
 
 
 @torch.no_grad()
-def evaluate_ca_model(model, dataloader, device, *, max_batches=None, ctx=None):
+def evaluate_ca_model(
+    forward_context: CAForwardContext,
+    dataloader,
+    device,
+    *,
+    max_batches=None,
+    ctx=None,
+):
     """Evaluate one fixed-length CA split and restore the model's prior mode."""
+    model = forward_context.model
     was_training = model.training
     model.eval()
     counters = new_ca_counters()
@@ -206,7 +216,9 @@ def evaluate_ca_model(model, dataloader, device, *, max_batches=None, ctx=None):
                 device, dtype=torch.long, non_blocking=True
             )
             with ctx:
-                outputs = model(inputs, targets=labels, get_logits=True)
+                outputs = forward_context.call(
+                    inputs, targets=labels, get_logits=True
+                )
 
             if not isinstance(outputs, dict):
                 raise TypeError("CA models must return a dictionary of outputs.")
@@ -230,11 +242,18 @@ def evaluate_ca_model(model, dataloader, device, *, max_batches=None, ctx=None):
     return finalize_ca_metrics(counters)
 
 
-def evaluate_ca_lengths(model, eval_loaders, device, *, max_batches=None, ctx=None):
+def evaluate_ca_lengths(
+    forward_context: CAForwardContext,
+    eval_loaders,
+    device,
+    *,
+    max_batches=None,
+    ctx=None,
+):
     """Evaluate every configured row length independently."""
     return {
         num_cells: evaluate_ca_model(
-            model,
+            forward_context,
             dataloader,
             device,
             max_batches=max_batches,
@@ -245,28 +264,37 @@ def evaluate_ca_lengths(model, eval_loaders, device, *, max_batches=None, ctx=No
 
 
 def _forward_all_cells(
-    model,
+    forward_context: CAForwardContext,
     inputs,
     *,
     num_repeats=None,
     return_repeat_states=False,
     return_outputs=False,
+    intervention_source_depth=None,
+    intervention_input_ids=None,
 ):
-    """Run a CA model and require one binary logit vector per input cell."""
+    """Call once and require one binary logit vector per input cell.
+
+    Internal recurrence remains entirely inside the model. This helper only
+    ensures that inference returns logits for every spatial CA cell.
+    """
     forward_kwargs = {"get_logits": True, "return_all_logits": True}
     if num_repeats is not None:
         forward_kwargs["num_repeats"] = num_repeats
     if return_repeat_states:
         forward_kwargs["return_repeat_states"] = True
+    if intervention_source_depth is not None or intervention_input_ids is not None:
+        forward_kwargs["intervention_source_depth"] = intervention_source_depth
+        forward_kwargs["intervention_input_ids"] = intervention_input_ids
 
     try:
-        outputs = model(inputs, **forward_kwargs)
+        outputs = forward_context.call(inputs, **forward_kwargs)
     except TypeError as error:
         if "return_all_logits" in str(error):
             # Models not yet converted to the explicit all-position interface
             # retain the existing target-provided compatibility path below.
             forward_kwargs.pop("return_all_logits")
-            outputs = model(inputs, **forward_kwargs)
+            outputs = forward_context.call(inputs, **forward_kwargs)
         elif num_repeats is not None and "num_repeats" in str(error):
             raise TypeError(
                 "Internal-repeat evaluation requires the model forward method "
@@ -289,7 +317,7 @@ def _forward_all_cells(
         # logits directly and will not take this compatibility branch.
         retry_kwargs = dict(forward_kwargs)
         retry_kwargs["targets"] = inputs
-        outputs = model(inputs, **retry_kwargs)
+        outputs = forward_context.call(inputs, **retry_kwargs)
         logits = outputs.get("logits") if isinstance(outputs, dict) else None
     if logits is None or tuple(logits.shape) != expected_shape:
         raise ValueError(
@@ -357,13 +385,117 @@ def _finalize_similarity(accumulator, *, decoded=False):
     return result
 
 
+@torch.no_grad()
+def evaluate_ca_clean_state_transitions(
+    forward_context: CAForwardContext,
+    dataloader,
+    device,
+    *,
+    max_transition_depth,
+    max_batches=None,
+    ctx=None,
+):
+    """Evaluate clean-current transitions while preserving free-rollout K/V.
+
+    For source depth ``t``, independently run the model from the original row
+    through ``t`` free repeats, replace only its current recurrent
+    representation with the canonical representation of exact Rule 30 row
+    ``x_t``, and run repeat ``t + 1`` with the historical middle-block cache
+    intact.  Compare that output with exact row ``x_(t+1)``.
+    """
+    if max_transition_depth <= 0:
+        raise ValueError("max_transition_depth must be positive.")
+
+    model = forward_context.model
+    was_training = model.training
+    model.eval()
+    counters = {
+        target_depth: new_ca_counters()
+        for target_depth in range(1, max_transition_depth + 1)
+    }
+    ctx = ctx or nullcontext()
+    consumed_batches = 0
+
+    try:
+        for batch_index, batch in enumerate(dataloader):
+            if max_batches is not None and batch_index >= max_batches:
+                break
+            consumed_batches += 1
+            initial_state = batch["input_id"].to(
+                device, dtype=torch.long, non_blocking=True
+            )
+            clean_state = initial_state
+
+            for source_depth in range(max_transition_depth):
+                target_depth = source_depth + 1
+                clean_target = rule30(clean_state)
+                with ctx:
+                    logits, average_depth = _forward_all_cells(
+                        forward_context,
+                        initial_state,
+                        num_repeats=target_depth,
+                        intervention_source_depth=source_depth,
+                        intervention_input_ids=clean_state,
+                    )
+                loss = F.cross_entropy(
+                    logits.reshape(-1, 2), clean_target.reshape(-1)
+                )
+                update_ca_counters(
+                    counters[target_depth],
+                    logits,
+                    clean_target,
+                    loss=loss,
+                    average_depth=average_depth,
+                )
+                clean_state = clean_target
+    finally:
+        if was_training:
+            model.train()
+
+    if consumed_batches == 0:
+        raise ValueError("Clean-state transition evaluation consumed no batches.")
+
+    return {
+        "max_transition_depth": max_transition_depth,
+        "transitions": {
+            f"steps_{target_depth - 1}_to_{target_depth}": {
+                "source_ca_steps": target_depth - 1,
+                "target_ca_steps": target_depth,
+                "num_repeats": target_depth,
+                "intervention_source_depth": target_depth - 1,
+                "metrics": finalize_ca_metrics(counters[target_depth]),
+            }
+            for target_depth in range(1, max_transition_depth + 1)
+        },
+        "num_batches": consumed_batches,
+    }
+
+
+def evaluate_ca_clean_state_transition_lengths(
+    forward_context: CAForwardContext,
+    eval_loaders,
+    device,
+    **kwargs,
+):
+    """Run the preserved-cache clean-state probe at every row length."""
+    return {
+        str(num_cells): evaluate_ca_clean_state_transitions(
+            forward_context,
+            dataloader,
+            device,
+            **kwargs,
+        )
+        for num_cells, dataloader in eval_loaders.items()
+    }
+
+
 def _binary_row_string(row):
     return "".join(str(int(value)) for value in row.detach().cpu().tolist())
 
 
 @torch.no_grad()
 def evaluate_ca_repeat_horizon_diagnostics(
-    model,
+    forward_context: CAForwardContext,
     dataloader,
     device,
     *,
@@ -391,6 +523,7 @@ def evaluate_ca_repeat_horizon_diagnostics(
     if not target_horizons or target_horizons[0] < 0:
         raise ValueError("target_horizons must contain non-negative values.")
 
+    model = forward_context.model
     repeat_counts = tuple(range(1, max_repeats + 1))
     matrix_counters = {
         (repeats, horizon): new_ca_counters()
@@ -445,7 +578,7 @@ def evaluate_ca_repeat_horizon_diagnostics(
             for repeats in repeat_counts:
                 with ctx:
                     logits, average_depth, outputs = _forward_all_cells(
-                        model,
+                        forward_context,
                         inputs,
                         num_repeats=repeats,
                         return_repeat_states=(
@@ -711,7 +844,7 @@ def evaluate_ca_repeat_horizon_diagnostics(
 
 
 def evaluate_ca_repeat_horizon_lengths(
-    model,
+    forward_context: CAForwardContext,
     eval_loaders,
     device,
     **kwargs,
@@ -719,7 +852,7 @@ def evaluate_ca_repeat_horizon_lengths(
     """Run repeat diagnostics independently at every configured row length."""
     return {
         str(num_cells): evaluate_ca_repeat_horizon_diagnostics(
-            model,
+            forward_context,
             dataloader,
             device,
             **kwargs,
@@ -866,7 +999,7 @@ def _sum_depths(total_depth, new_depth):
 
 @torch.no_grad()
 def evaluate_ca_target(
-    model,
+    forward_context: CAForwardContext,
     dataloader,
     device,
     *,
@@ -889,6 +1022,7 @@ def evaluate_ca_target(
     if external_model_calls <= 0:
         raise ValueError("external_model_calls must be positive.")
 
+    model = forward_context.model
     was_training = model.training
     model.eval()
     counters = new_ca_counters()
@@ -910,7 +1044,7 @@ def evaluate_ca_target(
             for _ in range(external_model_calls):
                 with ctx:
                     logits, average_depth = _forward_all_cells(
-                        model,
+                        forward_context,
                         current_state,
                         num_repeats=num_repeats,
                     )
@@ -935,7 +1069,7 @@ def evaluate_ca_target(
 
 
 def evaluate_ca_target_lengths(
-    model,
+    forward_context: CAForwardContext,
     eval_loaders,
     device,
     *,
@@ -948,7 +1082,7 @@ def evaluate_ca_target_lengths(
     """Evaluate one horizon/repeat setting independently at every row length."""
     return {
         str(num_cells): evaluate_ca_target(
-            model,
+            forward_context,
             dataloader,
             device,
             ca_steps=ca_steps,
@@ -967,7 +1101,7 @@ def ca_pair_key(ca_steps, num_repeats):
 
 
 def evaluate_ca_pairs(
-    model,
+    forward_context: CAForwardContext,
     eval_loaders,
     device,
     *,
@@ -981,7 +1115,7 @@ def evaluate_ca_pairs(
             "ca_steps": ca_steps,
             "num_repeats": num_repeats,
             "by_length": evaluate_ca_target_lengths(
-                model,
+                forward_context,
                 eval_loaders,
                 device,
                 ca_steps=ca_steps,
@@ -995,7 +1129,7 @@ def evaluate_ca_pairs(
 
 
 def run_final_ca_evaluation(
-    model,
+    forward_context: CAForwardContext,
     eval_loaders,
     device,
     *,
@@ -1017,7 +1151,7 @@ def run_final_ca_evaluation(
         in_distribution = {
             "training_pairs": [list(pair) for pair in trained_pairs],
             "by_pair": evaluate_ca_pairs(
-                model,
+                forward_context,
                 eval_loaders,
                 device,
                 pairs=trained_pairs,
@@ -1031,7 +1165,7 @@ def run_final_ca_evaluation(
             "ca_steps": trained_ca_steps,
             "num_repeats": trained_num_repeats,
             "by_length": evaluate_ca_target_lengths(
-                model,
+                forward_context,
                 eval_loaders,
                 device,
                 ca_steps=trained_ca_steps,
@@ -1056,7 +1190,7 @@ def run_final_ca_evaluation(
             "ca_steps": ca_steps,
             "num_repeats": num_repeats,
             "by_length": evaluate_ca_target_lengths(
-                model,
+                forward_context,
                 eval_loaders,
                 device,
                 ca_steps=ca_steps,
@@ -1080,7 +1214,7 @@ def run_final_ca_evaluation(
             "model_calls": model_calls,
             "num_repeats_per_call": trained_num_repeats,
             "by_length": evaluate_ca_target_lengths(
-                model,
+                forward_context,
                 eval_loaders,
                 device,
                 ca_steps=target_ca_steps,
@@ -1092,3 +1226,113 @@ def run_final_ca_evaluation(
         }
 
     return results
+
+
+def supports_clean_state_intervention(model):
+    """Return whether ``model.forward`` explicitly supports the cache probe."""
+    parameters = inspect.signature(model.forward).parameters
+    return {
+        "intervention_source_depth",
+        "intervention_input_ids",
+    }.issubset(parameters)
+
+
+def evaluate_loaded_ca_checkpoint(
+    forward_context: CAForwardContext,
+    eval_loaders,
+    device,
+    *,
+    checkpoint_metadata,
+    label,
+    split_seed,
+    samples_per_length,
+    trained_ca_steps,
+    trained_num_repeats=None,
+    trained_pairs=(),
+    internal_pairs=(),
+    external_ca_steps=(),
+    final_eval_max_batches=None,
+    repeat_diagnostic_max_repeats=None,
+    repeat_diagnostic_horizons=None,
+    repeat_diagnostic_max_batches=None,
+    eval_max_batches=None,
+    repeat_diagnostic_examples=1,
+    forward_policy_metadata=None,
+    ctx=None,
+):
+    """Run the canonical final evaluation for one already-loaded checkpoint.
+
+    Both training and standalone checkpoint evaluation call this function so
+    task metrics, repeat diagnostics, intervention capability checks, and
+    returned reporting structure cannot drift between the two entry points.
+    The caller remains responsible for loading and validating checkpoint
+    weights before invoking it.
+    """
+    task_metrics = run_final_ca_evaluation(
+        forward_context,
+        eval_loaders,
+        device,
+        trained_ca_steps=trained_ca_steps,
+        trained_num_repeats=trained_num_repeats,
+        trained_pairs=trained_pairs,
+        internal_pairs=internal_pairs,
+        external_ca_steps=external_ca_steps,
+        max_batches=final_eval_max_batches,
+        ctx=ctx,
+    )
+    repeat_diagnostics = None
+    preserved_cache_clean_state_transitions = None
+    if repeat_diagnostic_max_repeats is not None:
+        diagnostic_max_batches = (
+            final_eval_max_batches
+            or repeat_diagnostic_max_batches
+            or eval_max_batches
+        )
+        repeat_diagnostics = evaluate_ca_repeat_horizon_lengths(
+            forward_context,
+            eval_loaders,
+            device,
+            max_repeats=repeat_diagnostic_max_repeats,
+            target_horizons=repeat_diagnostic_horizons,
+            max_batches=diagnostic_max_batches,
+            num_examples=repeat_diagnostic_examples,
+            collect_hidden_states=True,
+            ctx=ctx,
+        )
+        if supports_clean_state_intervention(forward_context.model):
+            preserved_cache_clean_state_transitions = (
+                evaluate_ca_clean_state_transition_lengths(
+                    forward_context,
+                    eval_loaders,
+                    device,
+                    max_transition_depth=repeat_diagnostic_max_repeats,
+                    max_batches=diagnostic_max_batches,
+                    ctx=ctx,
+                )
+            )
+        else:
+            print(
+                "Skipping preserved-cache clean-state transitions: "
+                "model.forward does not support the intervention arguments.",
+                flush=True,
+            )
+        rendered_examples = format_ca_repeat_examples(
+            repeat_diagnostics, step=f"final_{label}"
+        )
+        if rendered_examples:
+            print(rendered_examples, flush=True)
+
+    return {
+        "checkpoint": checkpoint_metadata,
+        "forward_policy": dict(forward_policy_metadata or {}),
+        "split": {
+            "role": "independent_final_test",
+            "seed": int(split_seed),
+            "samples_per_length": int(samples_per_length),
+        },
+        "task_metrics": task_metrics,
+        "repeat_diagnostics": repeat_diagnostics,
+        "preserved_cache_clean_state_transitions": (
+            preserved_cache_clean_state_transitions
+        ),
+    }

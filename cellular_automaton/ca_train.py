@@ -22,12 +22,19 @@ from optim.runner_utils import (
 try:
     from .ca_eval import (
         ca_pair_key,
+        evaluate_loaded_ca_checkpoint,
         evaluate_ca_lengths,
         evaluate_ca_pairs,
         evaluate_ca_repeat_horizon_lengths,
         format_ca_repeat_examples,
-        run_final_ca_evaluation,
+        supports_clean_state_intervention,
     )
+    from .ca_forward import (
+        FULL_CA_FORWARD_POLICY,
+        CAForwardContext,
+        CAForwardPolicy,
+    )
+
     from .ca_exposure import (
         add_training_exposure,
         rebuild_training_exposure,
@@ -37,12 +44,19 @@ try:
 except ImportError:
     from ca_eval import (
         ca_pair_key,
+        evaluate_loaded_ca_checkpoint,
         evaluate_ca_lengths,
         evaluate_ca_pairs,
         evaluate_ca_repeat_horizon_lengths,
         format_ca_repeat_examples,
-        run_final_ca_evaluation,
+        supports_clean_state_intervention,
     )
+    from ca_forward import (
+        FULL_CA_FORWARD_POLICY,
+        CAForwardContext,
+        CAForwardPolicy,
+    )
+
     from ca_exposure import add_training_exposure, rebuild_training_exposure
     from ca_gen import apply_rule30
     from ca_reporting import write_eval_metrics
@@ -68,6 +82,11 @@ def _loss_from_outputs(outputs):
 def _finite_or(value, fallback):
     value = float(value)
     return value if math.isfinite(value) else fallback
+
+
+def _supports_clean_state_intervention(model):
+    """Return whether ``model.forward`` explicitly supports the cache probe."""
+    return supports_clean_state_intervention(model)
 
 
 def ca_selection_key(metrics, primary_metric):
@@ -153,6 +172,20 @@ def _load_json(path, default):
         return json.load(handle)
 
 
+def _set_and_validate_forward_policy(stats, current_policy, *, start_step):
+    """Record one run-wide policy and reject incompatible resume attempts."""
+    if start_step > 0:
+        stored_policy = stats.get(
+            "forward_policy", FULL_CA_FORWARD_POLICY.metadata()
+        )
+        if stored_policy != current_policy:
+            raise ValueError(
+                "Cannot resume CA training with a different forward policy: "
+                f"stored={stored_policy}, requested={current_policy}."
+            )
+    stats["forward_policy"] = current_policy
+
+
 def _add_fixed_cot_diagnostics(logs, model, outputs=None):
     """Add optional fixed-CoT metrics without assuming a particular model."""
     if outputs:
@@ -209,7 +242,7 @@ def _add_fixed_cot_diagnostics(logs, model, outputs=None):
             metrics.clear()
 
 
-def _collect_diagnostics(model, dataloader, args):
+def _collect_diagnostics(forward_context, dataloader, args):
     batch = next(iter(dataloader))
     inputs = batch["input_id"].to(
         args.device, dtype=torch.long, non_blocking=args.device.type == "cuda"
@@ -217,11 +250,12 @@ def _collect_diagnostics(model, dataloader, args):
     labels = batch["label"].to(
         args.device, dtype=torch.long, non_blocking=args.device.type == "cuda"
     )
+    model = forward_context.model
     was_training = model.training
     model.eval()
     try:
         with torch.no_grad(), _autocast_context(args):
-            return model(inputs, targets=labels, get_logits=False)
+            return forward_context.call(inputs, targets=labels, get_logits=False)
     finally:
         if was_training:
             model.train()
@@ -260,6 +294,10 @@ def train_ca(
     """Train a model to predict all cells in a Rule 30 target row."""
     checkpoint_dir = Path(checkpoint_dir)
     raw_model = distributed_backend.get_raw_model(model)
+    forward_policy = CAForwardPolicy.from_args(args)
+    training_forward = CAForwardContext(model, forward_policy)
+    evaluation_forward = CAForwardContext(raw_model, forward_policy)
+    forward_policy_metadata = forward_policy.metadata()
     pin_memory = args.device.type == "cuda"
     train_pairs = tuple(args.ca_train_pairs or ())
     extrapolation_pairs = tuple(args.ca_extrapolation_val_pairs or ())
@@ -306,6 +344,9 @@ def train_ca(
             "best_extrapolation_strict": None,
             "best_extrapolation_unconstrained": None,
         },
+    )
+    _set_and_validate_forward_policy(
+        stats, forward_policy_metadata, start_step=start_step
     )
     stats.setdefault("best_id", stats.get("best"))
     stats.setdefault(
@@ -407,7 +448,7 @@ def train_ca(
             excluded_start = time.perf_counter()
             if train_pairs:
                 in_distribution_eval = evaluate_ca_pairs(
-                    raw_model,
+                    evaluation_forward,
                     eval_loaders,
                     args.device,
                     pairs=train_pairs,
@@ -424,7 +465,7 @@ def train_ca(
                 ]
             else:
                 in_distribution_eval = evaluate_ca_lengths(
-                    raw_model,
+                    evaluation_forward,
                     eval_loaders,
                     args.device,
                     max_batches=args.ca_eval_max_batches,
@@ -440,7 +481,7 @@ def train_ca(
             repeat_diagnostics = None
             if args.ca_repeat_diagnostic_max_repeats is not None:
                 repeat_diagnostics = evaluate_ca_repeat_horizon_lengths(
-                    raw_model,
+                    evaluation_forward,
                     eval_loaders,
                     args.device,
                     max_repeats=args.ca_repeat_diagnostic_max_repeats,
@@ -497,6 +538,7 @@ def train_ca(
                     "selection_key": list(candidate_key),
                     "checkpoint": best_id_checkpoint_path.name,
                     "selection_type": "in_distribution",
+                    "forward_policy": forward_policy_metadata,
                 }
                 if best_pair is not None:
                     best_id_info["ca_steps"] = best_pair[0]
@@ -580,6 +622,7 @@ def train_ca(
                             args.ca_extrapolation_min_id_exact_sequence_accuracy
                         ),
                         "strict_id_gate_passed": extrapolation_strict_eligible,
+                        "forward_policy": forward_policy_metadata,
                     }
 
                 if update_unconstrained_extrapolation:
@@ -711,7 +754,7 @@ def train_ca(
                         ]
             if args.ca_log_fixed_cot_diagnostics:
                 diagnostic_outputs = _collect_diagnostics(
-                    raw_model, eval_loaders[diagnostic_length], args
+                    evaluation_forward, eval_loaders[diagnostic_length], args
                 )
                 _add_fixed_cot_diagnostics(logs, raw_model, diagnostic_outputs)
             _wandb_log(args, logs, step)
@@ -758,6 +801,7 @@ def train_ca(
                 # horizon is generated once for the whole GPU batch, ensuring
                 # that every sample in this optimizer step has the same target.
                 labels = apply_rule30(inputs, steps=active_ca_steps)
+       
             forward_kwargs = {"targets": labels, "get_logits": False}
             if active_pair is not None:
                 forward_kwargs["num_repeats"] = active_num_repeats
@@ -776,7 +820,7 @@ def train_ca(
                     microstep_idx=microstep_index,
                     gradient_accumulation_steps=args.acc_steps,
                 ):
-                    outputs = model(inputs, **forward_kwargs)
+                    outputs = training_forward.call(inputs, **forward_kwargs)
                     loss = _loss_from_outputs(outputs)
             (loss / args.acc_steps).backward()
             accumulated_loss += float(loss.detach().float().item())
@@ -960,6 +1004,7 @@ def train_ca(
             raise RuntimeError(
                 "CA training completed without selecting a best ID checkpoint."
             )
+
         supports_repeat_override = (
             "num_repeats" in inspect.signature(raw_model.forward).parameters
         )
@@ -972,50 +1017,32 @@ def train_ca(
         def evaluate_checkpoint(checkpoint_path, metadata, label):
             checkpoint = torch.load(checkpoint_path, map_location=args.device)
             raw_model.load_state_dict(checkpoint["model"], strict=True)
-            task_metrics = run_final_ca_evaluation(
-                raw_model,
+            return evaluate_loaded_ca_checkpoint(
+                evaluation_forward,
                 test_loaders,
                 args.device,
+                checkpoint_metadata=metadata,
+                label=label,
+                split_seed=args.ca_test_seed,
+                samples_per_length=args.ca_test_samples,
                 trained_ca_steps=trained_ca_steps,
                 trained_num_repeats=trained_repeats,
                 trained_pairs=train_pairs,
                 internal_pairs=args.ca_final_eval_pairs,
                 external_ca_steps=args.ca_final_external_steps,
-                max_batches=args.ca_final_eval_max_batches,
+                final_eval_max_batches=args.ca_final_eval_max_batches,
+                repeat_diagnostic_max_repeats=(
+                    args.ca_repeat_diagnostic_max_repeats
+                ),
+                repeat_diagnostic_horizons=args.ca_repeat_diagnostic_horizons,
+                repeat_diagnostic_max_batches=(
+                    args.ca_repeat_diagnostic_max_batches
+                ),
+                eval_max_batches=args.ca_eval_max_batches,
+                repeat_diagnostic_examples=args.ca_repeat_diagnostic_examples,
+                forward_policy_metadata=forward_policy_metadata,
                 ctx=_autocast_context(args),
             )
-            repeat_diagnostics = None
-            if args.ca_repeat_diagnostic_max_repeats is not None:
-                repeat_diagnostics = evaluate_ca_repeat_horizon_lengths(
-                    raw_model,
-                    test_loaders,
-                    args.device,
-                    max_repeats=args.ca_repeat_diagnostic_max_repeats,
-                    target_horizons=args.ca_repeat_diagnostic_horizons,
-                    max_batches=(
-                        args.ca_final_eval_max_batches
-                        or args.ca_repeat_diagnostic_max_batches
-                        or args.ca_eval_max_batches
-                    ),
-                    num_examples=args.ca_repeat_diagnostic_examples,
-                    collect_hidden_states=True,
-                    ctx=_autocast_context(args),
-                )
-                rendered_examples = format_ca_repeat_examples(
-                    repeat_diagnostics, step=f"final_{label}"
-                )
-                if rendered_examples:
-                    print(rendered_examples, flush=True)
-            return {
-                "checkpoint": metadata,
-                "split": {
-                    "role": "independent_final_test",
-                    "seed": args.ca_test_seed,
-                    "samples_per_length": args.ca_test_samples,
-                },
-                "task_metrics": task_metrics,
-                "repeat_diagnostics": repeat_diagnostics,
-            }
 
         best_id_checkpoint_eval = evaluate_checkpoint(
             checkpoint_dir / best_id_info["checkpoint"],
