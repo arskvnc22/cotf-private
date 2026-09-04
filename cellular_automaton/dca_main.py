@@ -45,7 +45,7 @@ try:
         update_run_manifest_status,
         write_run_manifest,
     )
-    from .ca_train import train_ca
+    from .ca_delayed_train import train_ca
 except ImportError:
     # Support direct execution as ``python cellular_automaton/ca_main.py``.
     from ca_gen import MaterializedRule30Dataset, Rule30Dataset
@@ -57,7 +57,7 @@ except ImportError:
         update_run_manifest_status,
         write_run_manifest,
     )
-    from ca_train import train_ca
+    from ca_delayed_train import train_ca
 
 
 CA_TASK_NAME = "rule30"
@@ -224,6 +224,15 @@ def get_args():
         default="exact_sequence_accuracy",
     )
     parser.add_argument(
+        "--ca_delayed_best_metric",
+        choices=["exact_sequence_accuracy", "cell_accuracy", "loss"],
+        default="cell_accuracy",
+        help=(
+            "Metric used to select best_delayed_recall.pt from the pair-balanced "
+            "nontrivial delayed queries."
+        ),
+    )
+    parser.add_argument(
         "--ca_extrapolation_val_pairs",
         type=ca_step_repeat_pair,
         nargs="*",
@@ -279,12 +288,35 @@ def get_args():
         ),
     )
     parser.add_argument(
+    "--ca_query_loss_weight",
+    type=float,
+    default=1.0,
+    help=(
+        "Weight assigned to the delayed-query loss relative to the "
+        "mean intermediate evolution loss."
+    ),
+    )
+    parser.add_argument(
         "--ca_repeat_diagnostic_horizons",
         type=int,
         nargs="*",
         default=None,
         metavar="STEPS",
         help="True Rule 30 horizons used as matrix columns; defaults to 0..max repeats.",
+    )
+    parser.add_argument(
+        "--ca_max_relative_age",
+        type=int,
+        default=None,
+        help=(
+            "Largest supported relative-age embedding index. For training through "
+            "a horizon of T repeats this must be at least T."
+        ),
+    )
+    parser.add_argument(
+    "--ca_controller_application",
+    choices=("persistent", "subtract"),
+    default="persistent",
     )
     parser.add_argument(
         "--ca_repeat_diagnostic_examples",
@@ -520,6 +552,41 @@ def apply_ca_task_config(args, distributed_backend):
         raise ValueError("--ca_eval_num_cells must contain positive lengths.")
     if args.ca_steps <= 0:
         raise ValueError("--ca_steps must be positive.")
+    if not args.ca_train_pairs:
+        raise ValueError("Delayed CA training requires --ca_train_pairs.")
+    if not 0 <= args.ca_delayed_percentage <= 100:
+        raise ValueError("--ca_delayed_percentage must lie in [0, 100].")
+    if (
+        not np.isfinite(args.ca_query_loss_weight)
+        or args.ca_query_loss_weight < 0
+    ):
+        raise ValueError(
+            "--ca_query_loss_weight must be finite and non-negative."
+        )
+    if any(ca_steps != repeats for ca_steps, repeats in args.ca_train_pairs):
+        raise ValueError(
+            "Delayed recall currently requires diagonal training pairs such as 5:5."
+        )
+    maximum_training_repeats = max(
+        repeats for _, repeats in args.ca_train_pairs
+    )
+    if maximum_training_repeats <= 1:
+        raise ValueError(
+            "Delayed-recall checkpoint selection requires at least one training "
+            "pair with more than one repeat."
+        )
+    if args.ca_max_relative_age is None:
+        args.ca_max_relative_age = maximum_training_repeats
+    elif args.ca_max_relative_age < maximum_training_repeats:
+        raise ValueError(
+            "--ca_max_relative_age must be at least the largest configured "
+            f"training repeat count ({maximum_training_repeats})."
+        )
+    if args.n_layer_end != 0:
+        raise ValueError(
+            "Delayed same-run internal-consistency evaluation requires "
+            "--n_layer_end 0."
+        )
     if args.ca_train_pairs:
         if len(set(args.ca_train_pairs)) != len(args.ca_train_pairs):
             raise ValueError("--ca_train_pairs cannot contain duplicate pairs.")
@@ -646,9 +713,12 @@ def apply_ca_task_config(args, distributed_backend):
             f"invalid values: {invalid_external_steps}."
         )
 
-    configured_pairs = tuple(args.ca_train_pairs or ()) + tuple(
-        args.ca_extrapolation_val_pairs
-    ) + tuple(args.ca_final_eval_pairs)
+    # Delayed evaluation already captures every trained repeat from the same
+    # forward execution. Do not implicitly enable the older repeat-horizon
+    # diagnostic merely because delayed training pairs are configured.
+    configured_pairs = tuple(args.ca_extrapolation_val_pairs) + tuple(
+        args.ca_final_eval_pairs
+    )
     if args.ca_repeat_diagnostic_max_repeats is None and configured_pairs:
         args.ca_repeat_diagnostic_max_repeats = max(
             repeats for _, repeats in configured_pairs
@@ -656,6 +726,16 @@ def apply_ca_task_config(args, distributed_backend):
     if args.ca_repeat_diagnostic_max_repeats is not None:
         if args.ca_repeat_diagnostic_max_repeats <= 0:
             raise ValueError("--ca_repeat_diagnostic_max_repeats must be positive.")
+        if (
+            args.ca_repeat_diagnostic_max_repeats
+            > args.ca_max_relative_age
+        ):
+            raise ValueError(
+                "--ca_repeat_diagnostic_max_repeats cannot exceed "
+                "--ca_max_relative_age for DCA models; got "
+                f"{args.ca_repeat_diagnostic_max_repeats} versus "
+                f"{args.ca_max_relative_age}."
+            )
         if args.ca_repeat_diagnostic_horizons is None:
             args.ca_repeat_diagnostic_horizons = list(
                 range(args.ca_repeat_diagnostic_max_repeats + 1)
@@ -872,6 +952,11 @@ def main(args):
                 "n_repeat": args.n_repeat,
                 "best_length": args.ca_best_length,
                 "best_metric": args.ca_best_metric,
+                "delayed_percentage": args.ca_delayed_percentage,
+                "query_horizon_policy": args.query_horizon_policy,
+                "max_relative_age": args.ca_max_relative_age,
+                "controller_application": args.ca_controller_application,
+                "delayed_best_metric": args.ca_delayed_best_metric,
                 "start_step": start_step,
                 "device": str(args.device),
             },

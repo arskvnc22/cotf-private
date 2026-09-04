@@ -10,7 +10,9 @@ from . import but_mod_efficient_sigmoid_lnmid_depthemb_random_factor_for_mac_com
 from . import tak_custom_cot
 from . import fixed_cot_attn
 from . import flash_train_caus_eval
-
+from . import ca_cotf
+from . import ca_cotf_cache_attn
+from . import but_soca
 MODELS = {
     "base": base.GPTBase,
     "adaptive_cotformer_mod_efficient_sigmoid_crw_lnmid_de_random_factor_single_final": adaptive_cotformer_mod_efficient_sigmoid_crw_lnmid_de_random_factor_single_final.GPTBase,
@@ -24,6 +26,9 @@ MODELS = {
     "tak_custom_cot" : tak_custom_cot.GPTBase,
     "fixed_cot_attn" : fixed_cot_attn.GPTBase,
     "flash_train_caus_eval" : flash_train_caus_eval.GPTBase,
+    "ca_cotf" : ca_cotf.GPTBase,
+    "ca_cotf_cache_attn" : ca_cotf_cache_attn.GPTBase,
+    "but_soca" : but_soca.GPTBase,
 }
 
 

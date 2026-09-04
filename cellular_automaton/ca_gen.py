@@ -59,7 +59,23 @@ def generate_rule30_batch(
         "input_id": initial_state,
         "label": next_state,
     }
+def rollout_rule30(states, num_repeats):
+    """Return the Rule 30 state after every update.
 
+    [B, N] inputs produce [B, R, N] targets. The initial state is not
+    included.
+    """
+    if num_repeats <= 0:
+        raise ValueError("num_repeats must be positive.")
+
+    current = states
+    trajectory = []
+
+    for _ in range(num_repeats):
+        current = rule30(current)
+        trajectory.append(current)
+
+    return torch.stack(trajectory, dim=1)
 
 class Rule30Dataset(Dataset):
     """Finite, index-reproducible samples from a Bernoulli Rule 30 task.

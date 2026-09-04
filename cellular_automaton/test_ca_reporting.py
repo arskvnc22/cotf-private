@@ -41,6 +41,7 @@ def sample_args(seed=1, data_seed=11):
         "ca_extrapolation_val_pairs": [[3, 3]],
         "ca_final_eval_pairs": [[3, 3], [5, 5]],
         "ca_best_metric": "exact_sequence_accuracy",
+        "ca_best_length": 64,
         "ca_extrapolation_best_metric": "cell_accuracy",
         "seed": seed,
         "data_seed": data_seed,
@@ -108,6 +109,79 @@ def sample_stats():
             },
         }
     }
+    retrieval = {
+        "requested_repeat_is_best_rate": 0.75,
+        "requested_repeat_is_unique_best_rate": 0.5,
+        "requested_repeat_mean_rank": 1.25,
+        "requested_repeat_mean_reciprocal_rank": 0.875,
+        "requested_repeat_mean_margin_over_closest_wrong": 0.1,
+        "requested_repeat_positive_margin_rate": 0.75,
+        "total_sequences": 4,
+    }
+    collision = {
+        "cell_agreement": 0.4,
+        "exact_row_collision_rate": 0.1,
+        "exact_row_collisions": 1,
+        "total_sequences": 10,
+    }
+    delayed_query = {
+        "num_repeats": 3,
+        "query_repeat": 1,
+        "recall_age": 2,
+        "is_no_op": False,
+        "metrics": metric,
+        "ground_truth_comparison_by_repeat": {
+            "repeat_1": metric,
+            "repeat_2": {**metric, "matthews_correlation": 0.3},
+            "repeat_3": {**metric, "matthews_correlation": 0.2},
+        },
+        "ground_truth_state_collision_by_repeat": {
+            "repeat_1": {**collision, "exact_row_collision_rate": 1.0},
+            "repeat_2": collision,
+            "repeat_3": collision,
+        },
+        "ground_truth_retrieval": retrieval,
+        "internal_consistency": {
+            "decoded_requested_repeat": metric,
+            "decoded_comparison_by_repeat": {
+                "repeat_1": metric,
+                "repeat_2": metric,
+                "repeat_3": metric,
+            },
+            "decoded_state_collision_by_repeat": {
+                "repeat_1": {**collision, "exact_row_collision_rate": 1.0},
+                "repeat_2": collision,
+                "repeat_3": collision,
+            },
+            "requested_repeat_logit_similarity": {
+                "cosine_similarity": 0.9,
+                "normalized_mse": 0.1,
+            },
+            "logit_similarity_by_repeat": {
+                "repeat_1": {"cosine_similarity": 0.9, "normalized_mse": 0.1},
+                "repeat_2": {"cosine_similarity": 0.5, "normalized_mse": 0.5},
+                "repeat_3": {"cosine_similarity": 0.4, "normalized_mse": 0.6},
+            },
+            "decoded_retrieval": retrieval,
+            "cosine_retrieval": retrieval,
+        },
+    }
+    delayed_pair = {
+        "ca_steps": 3,
+        "num_repeats": 3,
+        "queries": {"query_repeat_1": delayed_query},
+        "all_queries_macro": metric,
+        "nontrivial_queries_macro": metric,
+        "all_queries_internal_consistency_macro": retrieval,
+        "nontrivial_internal_consistency_macro": retrieval,
+        "all_queries_ground_truth_retrieval_macro": retrieval,
+        "nontrivial_ground_truth_retrieval_macro": retrieval,
+    }
+    delayed_summary = {
+        "nontrivial_queries_pair_macro": metric,
+        "nontrivial_internal_consistency_pair_macro": retrieval,
+        "nontrivial_ground_truth_retrieval_pair_macro": retrieval,
+    }
     return {
         "eval": {
             "50": {
@@ -126,6 +200,10 @@ def sample_stats():
                     }
                 },
                 "repeat_diagnostics": diagnostics,
+                "delayed_recall": {
+                    "steps_3_repeats_3": delayed_pair,
+                },
+                "delayed_recall_summary": delayed_summary,
                 "training_exposure": {
                     "accounting_exact": True,
                     "legacy_approximated_steps": 0,
@@ -135,6 +213,24 @@ def sample_stats():
                     "total_examples_seen": 6400,
                     "total_cells_seen": 409600,
                     "equivalent_dataset_passes": 6.4,
+                    "by_mode": {
+                        "normal": {
+                            "optimizer_steps": 25,
+                            "microbatches": 25,
+                            "examples_seen": 3200,
+                            "cells_seen": 204800,
+                            "example_fraction": 0.5,
+                            "optimizer_step_fraction": 0.5,
+                        },
+                        "delayed": {
+                            "optimizer_steps": 25,
+                            "microbatches": 25,
+                            "examples_seen": 3200,
+                            "cells_seen": 204800,
+                            "example_fraction": 0.5,
+                            "optimizer_step_fraction": 0.5,
+                        },
+                    },
                     "by_training_pair": {
                         "steps_1_repeats_1": {
                             "ca_steps": 1,
@@ -145,6 +241,25 @@ def sample_stats():
                             "cells_seen": 204800,
                             "example_fraction": 0.5,
                             "optimizer_step_fraction": 0.5,
+                            "by_mode": {
+                                "normal": {
+                                    "optimizer_steps": 12,
+                                    "examples_seen": 1536,
+                                },
+                                "delayed": {
+                                    "optimizer_steps": 13,
+                                    "examples_seen": 1664,
+                                },
+                            },
+                            "delayed_by_query_repeat": {
+                                "query_repeat_1": {
+                                    "query_repeat": 1,
+                                    "recall_age": 0,
+                                    "target_steps": 1,
+                                    "optimizer_steps": 13,
+                                    "examples_seen": 1664,
+                                }
+                            },
                         }
                     },
                 },
@@ -187,6 +302,14 @@ def sample_stats():
             },
             "best_extrapolation_strict": None,
             "best_extrapolation_unconstrained": None,
+            "best_delayed_recall": {
+                "checkpoint": {"step": 50, "length": 64},
+                "task_metrics": {},
+                "delayed_recall": {
+                    "steps_3_repeats_3": delayed_pair,
+                },
+                "delayed_recall_summary": delayed_summary,
+            },
         },
     }
 
@@ -254,6 +377,14 @@ def test_normalization_exports_scalar_long_form_records(tmp_path):
     assert "external_rollout" in roles
     assert "training_exposure" in roles
     assert "training_exposure_by_pair" in roles
+    assert "training_exposure_normal" in roles
+    assert "training_exposure_by_pair_delayed" in roles
+    assert "training_exposure_delayed_query" in roles
+    assert "delayed_recall_ground_truth_candidate" in roles
+    assert "delayed_recall_internal_decoded_candidate" in roles
+    assert "delayed_recall_cosine_retrieval" in roles
+    assert "delayed_recall_ground_truth_collision" in roles
+    assert "delayed_recall_nontrivial_pair_macro" in roles
     assert not any(record["metric"] == "position_accuracy" for record in records)
 
     external = next(
@@ -291,6 +422,30 @@ def test_normalization_exports_scalar_long_form_records(tmp_path):
     assert exposure["ca_steps"] == 1
     assert exposure["num_repeats"] == 1
     assert exposure["value"] == 3200
+
+    candidate_mcc = next(
+        record
+        for record in records
+        if record["evaluation_role"]
+        == "delayed_recall_ground_truth_candidate"
+        and record["metric"] == "matthews_correlation"
+        and record["repeat_from"] == 1
+        and record["repeat_to"] == 2
+        and record["data_split"] == "validation"
+    )
+    assert candidate_mcc["num_repeats"] == 3
+    assert candidate_mcc["length"] == 64
+    assert candidate_mcc["value"] == 0.3
+
+    final_cosine_rank = next(
+        record
+        for record in records
+        if record["evaluation_role"] == "delayed_recall_cosine_retrieval"
+        and record["metric"] == "requested_repeat_mean_rank"
+        and record["checkpoint_type"] == "best_delayed_recall"
+    )
+    assert final_cosine_rank["data_split"] == "final_test"
+    assert final_cosine_rank["value"] == 1.25
 
 
 def test_normalization_infers_policy_for_historical_manifest(tmp_path):

@@ -21,6 +21,19 @@ Rank individual runs by their best validation step::
         --role repeat_horizon_diagnostic --select-pair 7:7 \
         --report-pairs 5:5 6:6 7:7 8:8 9:9
 
+Compare delayed-recall runs using two selected metrics::
+
+    python -m cellular_automaton.ca_analyze delayed-compare \
+        --run-id run_141__dca_but_h6_intermediate_persistent \
+                 run_142__dca_but_h6_intermediate_subtract \
+        --metrics cell_accuracy exact_sequence_accuracy
+
+Rank delayed-recall runs (the first metric determines rank)::
+
+    python -m cellular_automaton.ca_analyze delayed-leaderboard \
+        --where model~dca \
+        --metrics cell_accuracy ground_truth_unique_best_rate
+
 Plot extrapolation validation throughout training::
 
     python -m cellular_automaton.ca_analyze plot-training \
@@ -100,6 +113,201 @@ class Run:
     @property
     def run_id(self) -> str:
         return str(self.manifest["run_id"])
+
+
+@dataclass(frozen=True)
+class DelayedMetricSpec:
+    """Map one user-facing delayed metric across normalized report roles."""
+
+    label: str
+    overall_role: str
+    overall_metric: str
+    horizon_role: str
+    horizon_metric: str
+    query_role: str
+    query_metric: str
+    query_requires_requested_candidate: bool = False
+    id_metric: str | None = None
+    direction: str = "max"
+
+
+DELAYED_METRICS = {
+    "cell_accuracy": DelayedMetricSpec(
+        "cell",
+        "delayed_recall_nontrivial_pair_macro",
+        "cell_accuracy",
+        "delayed_recall_nontrivial_queries_macro",
+        "cell_accuracy",
+        "delayed_recall_ground_truth_requested",
+        "cell_accuracy",
+        id_metric="cell_accuracy",
+    ),
+    "exact_sequence_accuracy": DelayedMetricSpec(
+        "exact",
+        "delayed_recall_nontrivial_pair_macro",
+        "exact_sequence_accuracy",
+        "delayed_recall_nontrivial_queries_macro",
+        "exact_sequence_accuracy",
+        "delayed_recall_ground_truth_requested",
+        "exact_sequence_accuracy",
+        id_metric="exact_sequence_accuracy",
+    ),
+    "matthews_correlation": DelayedMetricSpec(
+        "MCC",
+        "delayed_recall_nontrivial_pair_macro",
+        "matthews_correlation",
+        "delayed_recall_nontrivial_queries_macro",
+        "matthews_correlation",
+        "delayed_recall_ground_truth_requested",
+        "matthews_correlation",
+        id_metric="matthews_correlation",
+    ),
+    "mean_bit_errors_per_sequence": DelayedMetricSpec(
+        "bit errors",
+        "delayed_recall_nontrivial_pair_macro",
+        "mean_bit_errors_per_sequence",
+        "delayed_recall_nontrivial_queries_macro",
+        "mean_bit_errors_per_sequence",
+        "delayed_recall_ground_truth_requested",
+        "mean_bit_errors_per_sequence",
+        id_metric="mean_bit_errors_per_sequence",
+        direction="min",
+    ),
+    "loss": DelayedMetricSpec(
+        "loss",
+        "delayed_recall_nontrivial_pair_macro",
+        "loss",
+        "delayed_recall_nontrivial_queries_macro",
+        "loss",
+        "delayed_recall_ground_truth_requested",
+        "loss",
+        id_metric="loss",
+        direction="min",
+    ),
+    "internal_cell_accuracy": DelayedMetricSpec(
+        "internal cell",
+        "delayed_recall_nontrivial_internal_pair_macro",
+        "decoded_requested_repeat_cell_accuracy",
+        "delayed_recall_nontrivial_internal_macro",
+        "decoded_requested_repeat_cell_accuracy",
+        "delayed_recall_internal_decoded_requested",
+        "cell_accuracy",
+    ),
+    "internal_exact_sequence_accuracy": DelayedMetricSpec(
+        "internal exact",
+        "delayed_recall_nontrivial_internal_pair_macro",
+        "decoded_requested_repeat_exact_sequence_accuracy",
+        "delayed_recall_nontrivial_internal_macro",
+        "decoded_requested_repeat_exact_sequence_accuracy",
+        "delayed_recall_internal_decoded_requested",
+        "exact_sequence_accuracy",
+    ),
+    "ground_truth_rank": DelayedMetricSpec(
+        "GT rank",
+        "delayed_recall_nontrivial_ground_truth_retrieval_pair_macro",
+        "requested_repeat_mean_rank",
+        "delayed_recall_nontrivial_ground_truth_retrieval_macro",
+        "requested_repeat_mean_rank",
+        "delayed_recall_ground_truth_retrieval",
+        "requested_repeat_mean_rank",
+        direction="min",
+    ),
+    "ground_truth_unique_best_rate": DelayedMetricSpec(
+        "GT unique best",
+        "delayed_recall_nontrivial_ground_truth_retrieval_pair_macro",
+        "requested_repeat_is_unique_best_rate",
+        "delayed_recall_nontrivial_ground_truth_retrieval_macro",
+        "requested_repeat_is_unique_best_rate",
+        "delayed_recall_ground_truth_retrieval",
+        "requested_repeat_is_unique_best_rate",
+    ),
+    "cosine_similarity": DelayedMetricSpec(
+        "cosine",
+        "delayed_recall_nontrivial_internal_pair_macro",
+        "requested_repeat_logit_cosine_similarity",
+        "delayed_recall_nontrivial_internal_macro",
+        "requested_repeat_logit_cosine_similarity",
+        "delayed_recall_internal_logit_similarity",
+        "cosine_similarity",
+        query_requires_requested_candidate=True,
+    ),
+    "cosine_rank": DelayedMetricSpec(
+        "cosine rank",
+        "delayed_recall_nontrivial_internal_pair_macro",
+        "cosine_requested_repeat_mean_rank",
+        "delayed_recall_nontrivial_internal_macro",
+        "cosine_requested_repeat_mean_rank",
+        "delayed_recall_cosine_retrieval",
+        "requested_repeat_mean_rank",
+        direction="min",
+    ),
+    "cosine_unique_best_rate": DelayedMetricSpec(
+        "cosine unique best",
+        "delayed_recall_nontrivial_internal_pair_macro",
+        "cosine_requested_repeat_is_unique_best_rate",
+        "delayed_recall_nontrivial_internal_macro",
+        "cosine_requested_repeat_is_unique_best_rate",
+        "delayed_recall_cosine_retrieval",
+        "requested_repeat_is_unique_best_rate",
+    ),
+}
+
+DELAYED_CANDIDATE_ROLES = frozenset(
+    {
+        "delayed_recall_ground_truth_candidate",
+        "delayed_recall_ground_truth_collision",
+        "delayed_recall_internal_decoded_candidate",
+        "delayed_recall_internal_decoded_collision",
+        "delayed_recall_internal_logit_similarity",
+    }
+)
+
+DELAYED_CANDIDATE_METRICS = frozenset(
+    {
+        "cell_accuracy",
+        "exact_sequence_accuracy",
+        "matthews_correlation",
+        "mean_bit_errors_per_sequence",
+        "cell_agreement",
+        "exact_row_collision_rate",
+        "cosine_similarity",
+        "normalized_mse",
+    }
+)
+
+DELAYED_PROTOCOL_FIELDS = (
+    "dataset",
+    "sequence_length",
+    "attention_mode",
+    "positional_encoder",
+    "lm_cache",
+    "ca_train_num_cells",
+    "ca_train_pairs",
+    "ca_train_samples",
+    "ca_boundary",
+    "ca_bernoulli_p",
+    "ca_data_mode",
+    "ca_exact_data_resume",
+    "ca_delayed_percentage",
+    "query_horizon_policy",
+    "ca_query_loss_weight",
+    "ca_max_relative_age",
+    "batch_size",
+    "acc_steps",
+    "iterations",
+    "opt",
+    "lr",
+    "weight_decay",
+    "grad_clip",
+    "scheduler",
+    "ca_eval_num_cells",
+    "ca_val_samples",
+    "ca_test_samples",
+    "ca_val_seed",
+    "ca_test_seed",
+    "ca_delayed_best_metric",
+    "eval_freq",
+)
 
 
 def canonical_pairs(pairs: Any) -> str:
@@ -1244,6 +1452,790 @@ def command_leaderboard(args: argparse.Namespace, runs: Sequence[Run]) -> int:
     return 0
 
 
+def _selected_delayed_specs(args: argparse.Namespace) -> dict[str, DelayedMetricSpec]:
+    metric_names = tuple(args.metrics)
+    if not 1 <= len(metric_names) <= 2:
+        raise ValueError("--metrics requires one or two delayed metric names.")
+    if len(set(metric_names)) != len(metric_names):
+        raise ValueError("--metrics cannot contain duplicates.")
+    return {name: DELAYED_METRICS[name] for name in metric_names}
+
+
+def _select_delayed_runs(
+    runs: Sequence[Run], requested_run_ids: Sequence[str] | None
+) -> list[Run]:
+    if not requested_run_ids:
+        return list(runs)
+    if len(set(requested_run_ids)) != len(requested_run_ids):
+        raise ValueError("--run-id cannot contain duplicates.")
+    by_id = {run.run_id: run for run in runs}
+    missing = [run_id for run_id in requested_run_ids if run_id not in by_id]
+    if missing:
+        raise ValueError(
+            "Requested run IDs were not found under --runs: "
+            + ", ".join(missing)
+        )
+    return [by_id[run_id] for run_id in requested_run_ids]
+
+
+def delayed_protocol_configuration(manifest: Mapping[str, Any]) -> dict[str, Any]:
+    """Return fields that should agree in a controlled DCA comparison."""
+
+    resolved = manifest.get("resolved_args", {})
+    protocol = {}
+    for field in DELAYED_PROTOCOL_FIELDS:
+        value = resolved.get(field)
+        if field == "ca_train_pairs":
+            value = canonical_pairs(value or ())
+        elif isinstance(value, list):
+            value = tuple(value)
+        protocol[field] = value
+    policy = forward_policy_metadata(manifest)
+    protocol["repeat_cache_policy"] = policy["repeat_cache_policy"]
+    protocol["repeat_cache_window"] = policy["repeat_cache_window"]
+    return protocol
+
+
+def _delayed_comparison_configuration(
+    manifest: Mapping[str, Any], *, average_over: Sequence[str]
+) -> dict[str, Any]:
+    """Group replicate seeds without merging distinct DCA configurations."""
+
+    configuration = comparison_configuration(
+        manifest, average_over=average_over
+    )
+    resolved = dict(configuration["resolved_args"])
+    if "data_seed" in average_over:
+        # The DCA launcher derives the shuffle seed from the data seed unless
+        # explicitly overridden. It belongs to replicate identity here.
+        resolved.pop("ca_shuffle_seed", None)
+    return {
+        **configuration,
+        "resolved_args": resolved,
+    }
+
+
+def _delayed_groups(
+    runs: Sequence[Run], *, average_over: Sequence[str]
+) -> dict[str, list[Run]]:
+    groups: dict[str, list[Run]] = defaultdict(list)
+    for run in runs:
+        configuration = _delayed_comparison_configuration(
+            run.manifest, average_over=average_over
+        )
+        groups[configuration_id(configuration)].append(run)
+    return dict(groups)
+
+
+def _checkpoint_matches(record: Mapping[str, Any], requested: str) -> bool:
+    if requested == "any":
+        return True
+    if requested == "none":
+        return record.get("checkpoint_type") is None
+    return record.get("checkpoint_type") == requested
+
+
+def _put_latest(
+    destination: dict[Any, dict[str, Any]],
+    key: Any,
+    record: Mapping[str, Any],
+) -> None:
+    step = record.get("step")
+    previous = destination.get(key)
+    previous_step = previous.get("step") if previous else None
+    if previous is None or (
+        step is not None
+        and (previous_step is None or int(step) > int(previous_step))
+    ):
+        destination[key] = {
+            "step": None if step is None else int(step),
+            "value": float(record["value"]),
+        }
+
+
+def collect_delayed_run(
+    run: Run,
+    args: argparse.Namespace,
+    specs: Mapping[str, DelayedMetricSpec],
+) -> dict[str, Any]:
+    """Stream one JSONL file and retain only the selected DCA measurements."""
+
+    result: dict[str, Any] = {
+        "overall": {},
+        "horizons": {},
+        "queries": {},
+        "in_distribution": {},
+        "validation": {},
+        "candidates": {},
+    }
+    overall_lookup = {
+        (spec.overall_role, spec.overall_metric): name
+        for name, spec in specs.items()
+    }
+    horizon_lookup = {
+        (spec.horizon_role, spec.horizon_metric): name
+        for name, spec in specs.items()
+    }
+    query_lookup = {
+        (spec.query_role, spec.query_metric): (name, spec)
+        for name, spec in specs.items()
+    }
+    id_lookup = {
+        spec.id_metric: name
+        for name, spec in specs.items()
+        if spec.id_metric is not None
+    }
+
+    for record in iter_metrics(run.path / METRICS_FILENAME):
+        if args.length is not None and record.get("length") != args.length:
+            continue
+        role = record.get("evaluation_role")
+        metric = record.get("metric")
+        split = record.get("data_split")
+
+        if split == "validation" and record.get("checkpoint_type") is None:
+            selected = overall_lookup.get((role, metric))
+            if selected is not None and record.get("step") is not None:
+                result["validation"].setdefault(int(record["step"]), {})[
+                    selected
+                ] = float(record["value"])
+
+        if split != args.split or not _checkpoint_matches(
+            record, args.checkpoint
+        ):
+            continue
+
+        selected = overall_lookup.get((role, metric))
+        if selected is not None:
+            _put_latest(result["overall"], selected, record)
+            continue
+
+        selected = horizon_lookup.get((role, metric))
+        if selected is not None:
+            horizon = record.get("num_repeats")
+            if horizon is not None:
+                _put_latest(
+                    result["horizons"], (int(horizon), selected), record
+                )
+            continue
+
+        query_match = query_lookup.get((role, metric))
+        if query_match is not None:
+            selected, spec = query_match
+            horizon = record.get("num_repeats")
+            query_repeat = record.get("repeat_from")
+            candidate = record.get("repeat_to")
+            if horizon is None or query_repeat is None:
+                continue
+            if (
+                spec.query_requires_requested_candidate
+                and candidate != query_repeat
+            ):
+                continue
+            _put_latest(
+                result["queries"],
+                (int(horizon), int(query_repeat), selected),
+                record,
+            )
+            # The requested-candidate cosine record is also useful in the
+            # complete candidate export, so it is intentionally not skipped.
+
+        if role == "in_distribution" and metric in id_lookup:
+            horizon = record.get("num_repeats")
+            if horizon is None:
+                horizon = record.get("ca_steps")
+            if horizon is not None:
+                _put_latest(
+                    result["in_distribution"],
+                    (int(horizon), id_lookup[metric]),
+                    record,
+                )
+
+        if role in DELAYED_CANDIDATE_ROLES and metric in DELAYED_CANDIDATE_METRICS:
+            horizon = record.get("num_repeats")
+            query_repeat = record.get("repeat_from")
+            candidate = record.get("repeat_to")
+            if None not in (horizon, query_repeat, candidate):
+                _put_latest(
+                    result["candidates"],
+                    (
+                        int(horizon),
+                        int(query_repeat),
+                        int(candidate),
+                        str(role),
+                        str(metric),
+                    ),
+                    record,
+                )
+    return result
+
+
+def _delayed_configuration_metadata(
+    configuration_id_value: str,
+    members: Sequence[Run],
+    protocol_ids: Mapping[str, str],
+) -> dict[str, Any]:
+    representative = members[0]
+    manifest = representative.manifest
+    protocol = delayed_protocol_configuration(manifest)
+    protocol_key = json.dumps(protocol, sort_keys=True, default=str)
+    policy = forward_policy_metadata(manifest)
+    return {
+        "configuration_id": configuration_id_value,
+        "configuration": configuration_label(manifest),
+        "model": dotted_get(manifest, "model"),
+        "controller_application": manifest.get("model", {}).get(
+            "ca_controller_application"
+        ),
+        "architecture": architecture_signature(manifest),
+        "training_cache_policy": policy["repeat_cache_policy"],
+        "training_cache_window": policy["repeat_cache_window"],
+        "protocol_id": protocol_ids[protocol_key],
+        "run_ids": [run.run_id for run in members],
+        "model_seeds": [dotted_get(run.manifest, "seed") for run in members],
+        "data_seeds": [
+            dotted_get(run.manifest, "data_seed") for run in members
+        ],
+    }
+
+
+def _delayed_summary_row(
+    metadata: Mapping[str, Any],
+    metric: str,
+    observations: Sequence[tuple[float, Run, int | None]],
+    **dimensions: Any,
+) -> dict[str, Any]:
+    values = [value for value, _run, _step in observations]
+    contributing_runs = sorted(
+        {run.run_id: run for _value, run, _step in observations}.values(),
+        key=lambda run: run.run_id,
+    )
+    steps = sorted(
+        {step for _value, _run, step in observations if step is not None}
+    )
+    return {
+        **metadata,
+        **dimensions,
+        "metric": metric,
+        "metric_label": DELAYED_METRICS[metric].label,
+        "contributing_run_ids": [run.run_id for run in contributing_runs],
+        "checkpoint_steps": steps,
+        **summarize(values),
+    }
+
+
+def aggregate_delayed_runs(
+    runs: Sequence[Run],
+    run_data: Mapping[str, Mapping[str, Any]],
+    args: argparse.Namespace,
+    specs: Mapping[str, DelayedMetricSpec],
+) -> dict[str, Any]:
+    average_over = _field_list(args.average_over, ("seed", "data_seed"))
+    groups = _delayed_groups(runs, average_over=average_over)
+    protocol_values = {
+        json.dumps(
+            delayed_protocol_configuration(run.manifest),
+            sort_keys=True,
+            default=str,
+        )
+        for run in runs
+    }
+    protocol_ids = {
+        value: f"P{index}"
+        for index, value in enumerate(sorted(protocol_values), start=1)
+    }
+    configurations = []
+    metadata_by_group = {}
+    for configuration_order, (group_id, members) in enumerate(groups.items()):
+        metadata = _delayed_configuration_metadata(
+            group_id, members, protocol_ids
+        )
+        metadata["configuration_order"] = configuration_order
+        metadata_by_group[group_id] = metadata
+        configurations.append(
+            {
+                **metadata,
+                "protocol": delayed_protocol_configuration(
+                    members[0].manifest
+                ),
+            }
+        )
+
+    rows_by_scope: dict[str, list[dict[str, Any]]] = {
+        "overall": [],
+        "horizons": [],
+        "queries": [],
+        "in_distribution": [],
+        "validation": [],
+        "candidates": [],
+    }
+    for group_id, members in groups.items():
+        metadata = metadata_by_group[group_id]
+        for metric in specs:
+            observations = []
+            for run in members:
+                measurement = run_data[run.run_id]["overall"].get(metric)
+                if measurement is not None:
+                    observations.append(
+                        (measurement["value"], run, measurement["step"])
+                    )
+            if observations:
+                rows_by_scope["overall"].append(
+                    _delayed_summary_row(metadata, metric, observations)
+                )
+
+        horizon_keys = sorted(
+            {
+                key
+                for run in members
+                for key in run_data[run.run_id]["horizons"]
+            }
+        )
+        for horizon, metric in horizon_keys:
+            observations = []
+            for run in members:
+                measurement = run_data[run.run_id]["horizons"].get(
+                    (horizon, metric)
+                )
+                if measurement is not None:
+                    observations.append(
+                        (measurement["value"], run, measurement["step"])
+                    )
+            if observations:
+                rows_by_scope["horizons"].append(
+                    _delayed_summary_row(
+                        metadata, metric, observations, horizon=horizon
+                    )
+                )
+
+        query_keys = sorted(
+            {
+                key
+                for run in members
+                for key in run_data[run.run_id]["queries"]
+            }
+        )
+        for horizon, query_repeat, metric in query_keys:
+            observations = []
+            for run in members:
+                measurement = run_data[run.run_id]["queries"].get(
+                    (horizon, query_repeat, metric)
+                )
+                if measurement is not None:
+                    observations.append(
+                        (measurement["value"], run, measurement["step"])
+                    )
+            if observations:
+                rows_by_scope["queries"].append(
+                    _delayed_summary_row(
+                        metadata,
+                        metric,
+                        observations,
+                        horizon=horizon,
+                        query_repeat=query_repeat,
+                        recall_age=horizon - query_repeat,
+                        is_no_op=query_repeat == horizon,
+                    )
+                )
+
+        id_keys = sorted(
+            {
+                key
+                for run in members
+                for key in run_data[run.run_id]["in_distribution"]
+            }
+        )
+        for horizon, metric in id_keys:
+            observations = []
+            for run in members:
+                measurement = run_data[run.run_id]["in_distribution"].get(
+                    (horizon, metric)
+                )
+                if measurement is not None:
+                    observations.append(
+                        (measurement["value"], run, measurement["step"])
+                    )
+            if observations:
+                rows_by_scope["in_distribution"].append(
+                    _delayed_summary_row(
+                        metadata, metric, observations, horizon=horizon
+                    )
+                )
+
+        validation_keys = sorted(
+            {
+                (step, metric)
+                for run in members
+                for step, values in run_data[run.run_id]["validation"].items()
+                for metric in values
+            }
+        )
+        for step, metric in validation_keys:
+            observations = [
+                (
+                    run_data[run.run_id]["validation"][step][metric],
+                    run,
+                    step,
+                )
+                for run in members
+                if metric
+                in run_data[run.run_id]["validation"].get(step, {})
+            ]
+            rows_by_scope["validation"].append(
+                _delayed_summary_row(
+                    metadata, metric, observations, training_step=step
+                )
+            )
+
+        candidate_keys = sorted(
+            {
+                key
+                for run in members
+                for key in run_data[run.run_id]["candidates"]
+            }
+        )
+        for key in candidate_keys:
+            horizon, query_repeat, candidate_repeat, role, raw_metric = key
+            observations = []
+            for run in members:
+                measurement = run_data[run.run_id]["candidates"].get(key)
+                if measurement is not None:
+                    observations.append(
+                        (measurement["value"], run, measurement["step"])
+                    )
+            if observations:
+                values = [value for value, _run, _step in observations]
+                rows_by_scope["candidates"].append(
+                    {
+                        **metadata,
+                        "horizon": horizon,
+                        "query_repeat": query_repeat,
+                        "recall_age": horizon - query_repeat,
+                        "candidate_repeat": candidate_repeat,
+                        "evaluation_role": role,
+                        "metric": raw_metric,
+                        "contributing_run_ids": [
+                            run.run_id for _value, run, _step in observations
+                        ],
+                        **summarize(values),
+                    }
+                )
+    return {
+        "configurations": configurations,
+        "protocol_count": len(protocol_ids),
+        "seed_coverage_count": len(
+            {
+                tuple(
+                    sorted(
+                        zip(
+                            configuration["model_seeds"],
+                            configuration["data_seeds"],
+                        ),
+                        key=lambda pair: (str(pair[0]), str(pair[1])),
+                    )
+                )
+                for configuration in configurations
+            }
+        ),
+        **rows_by_scope,
+    }
+
+
+def _delayed_table_by_metric(
+    rows: Sequence[Mapping[str, Any]],
+    specs: Mapping[str, DelayedMetricSpec],
+    dimension_fields: Sequence[str],
+) -> tuple[tuple[str, ...], list[tuple[Any, ...]]]:
+    keyed = {
+        (
+            row["configuration_id"],
+            *(row.get(field) for field in dimension_fields),
+            row["metric"],
+        ): row
+        for row in rows
+    }
+    configuration_order = {
+        row["configuration_id"]: row["configuration_order"] for row in rows
+    }
+    dimensions = sorted(
+        {
+            (
+                row["configuration_id"],
+                *(row.get(field) for field in dimension_fields),
+            )
+            for row in rows
+        },
+        key=lambda value: (
+            configuration_order[value[0]],
+            *(
+                (0, int(part))
+                if isinstance(part, (bool, int))
+                else (1, str(part))
+                for part in value[1:]
+            ),
+        ),
+    )
+    rendered = []
+    for dimension in dimensions:
+        values = []
+        for metric in specs:
+            row = keyed.get((*dimension, metric))
+            values.append("—" if row is None else _format_summary(row))
+        rendered.append((*dimension, *values))
+    headers = (
+        "config id",
+        *dimension_fields,
+        *(spec.label for spec in specs.values()),
+    )
+    return headers, rendered
+
+
+def _print_delayed_comparison(
+    report: Mapping[str, Any], specs: Mapping[str, DelayedMetricSpec]
+) -> None:
+    configuration_rows = []
+    for config in report["configurations"]:
+        configuration_rows.append(
+            (
+                config["configuration_id"],
+                config["model"],
+                config["controller_application"],
+                config["architecture"],
+                config["training_cache_policy"],
+                config["protocol_id"],
+                ",".join(config["run_ids"]),
+                ",".join(map(str, config["model_seeds"])),
+                ",".join(map(str, config["data_seeds"])),
+            )
+        )
+    print("Delayed CA configurations")
+    print(
+        _terminal_table(
+            (
+                "config id",
+                "model",
+                "controller",
+                "architecture",
+                "cache",
+                "protocol",
+                "runs",
+                "seeds",
+                "data seeds",
+            ),
+            configuration_rows,
+        )
+    )
+    if report["protocol_count"] > 1:
+        print(
+            "WARNING: selected configurations use different delayed-CA "
+            "protocols; inspect delayed_comparison.json before interpreting "
+            "performance differences."
+        )
+    if report["seed_coverage_count"] > 1:
+        print(
+            "WARNING: configurations do not have identical model/data seed "
+            "coverage; aggregate differences are not fully paired."
+        )
+
+    sections = (
+        ("Overall nontrivial delayed recall", "overall", ()),
+        ("Delayed recall by horizon", "horizons", ("horizon",)),
+        (
+            "Delayed recall by query",
+            "queries",
+            ("horizon", "query_repeat", "recall_age", "is_no_op"),
+        ),
+        (
+            "In-distribution CA accuracy from the same checkpoint",
+            "in_distribution",
+            ("horizon",),
+        ),
+    )
+    for title, key, dimensions in sections:
+        rows = report[key]
+        if not rows:
+            continue
+        headers, rendered = _delayed_table_by_metric(rows, specs, dimensions)
+        print(f"\n{title}")
+        print(_terminal_table(headers, rendered))
+
+
+def _write_delayed_report(
+    report_dir: Path,
+    report: Mapping[str, Any],
+    args: argparse.Namespace,
+    runs: Sequence[Run],
+) -> None:
+    filenames = {
+        "overall": "delayed_summary.csv",
+        "queries": "delayed_queries.csv",
+        "candidates": "delayed_candidates.csv",
+        "validation": "delayed_validation.csv",
+    }
+    for key, filename in filenames.items():
+        _write_csv(report_dir / filename, report[key])
+    horizon_rows = [
+        {"scope": "delayed_nontrivial", **row}
+        for row in report["horizons"]
+    ] + [
+        {"scope": "in_distribution_same_checkpoint", **row}
+        for row in report["in_distribution"]
+    ]
+    _write_csv(report_dir / "delayed_horizons.csv", horizon_rows)
+    write_json(report_dir / "delayed_comparison.json", report)
+    _write_analysis_manifest(report_dir, args, runs)
+
+
+def _build_delayed_report(
+    args: argparse.Namespace, runs: Sequence[Run]
+) -> tuple[
+    list[Run],
+    dict[str, DelayedMetricSpec],
+    dict[str, Mapping[str, Any]],
+    dict[str, Any],
+]:
+    selected_runs = _select_delayed_runs(runs, args.run_id)
+    if not selected_runs:
+        raise ValueError("No run manifests matched the delayed comparison.")
+    specs = _selected_delayed_specs(args)
+    if args.length <= 0:
+        raise ValueError("--length must be positive.")
+    run_data = {
+        run.run_id: collect_delayed_run(run, args, specs)
+        for run in selected_runs
+    }
+    if not any(data["overall"] for data in run_data.values()):
+        raise ValueError(
+            "No overall delayed-recall records matched split="
+            f"{args.split}, checkpoint={args.checkpoint}, length={args.length}."
+        )
+    report = aggregate_delayed_runs(selected_runs, run_data, args, specs)
+    if args.strict_match and (
+        report["protocol_count"] > 1 or report["seed_coverage_count"] > 1
+    ):
+        raise ValueError(
+            "--strict-match requires one delayed-CA protocol and identical "
+            "model/data seed coverage; selected runs produced "
+            f"{report['protocol_count']} protocol(s) and "
+            f"{report['seed_coverage_count']} seed coverage set(s)."
+        )
+    return selected_runs, specs, run_data, report
+
+
+def command_delayed_compare(
+    args: argparse.Namespace, runs: Sequence[Run]
+) -> int:
+    selected_runs, specs, _run_data, report = _build_delayed_report(args, runs)
+    _print_delayed_comparison(report, specs)
+    if args.output_dir is not None:
+        report_dir = _report_dir(args)
+        _write_delayed_report(report_dir, report, args, selected_runs)
+        print(f"\nWrote delayed comparison to {report_dir}")
+    return 0
+
+
+def command_delayed_leaderboard(
+    args: argparse.Namespace, runs: Sequence[Run]
+) -> int:
+    selected_runs, specs, run_data, report = _build_delayed_report(args, runs)
+    primary_metric = next(iter(specs))
+    default_direction = specs[primary_metric].direction
+    direction = (
+        default_direction if args.direction == "auto" else args.direction
+    )
+    overall_by_run: dict[str, dict[str, tuple[float, int | None]]] = defaultdict(dict)
+    for run in selected_runs:
+        data = run_data[run.run_id]
+        for metric, measurement in data["overall"].items():
+            overall_by_run[run.run_id][metric] = (
+                measurement["value"],
+                measurement["step"],
+            )
+    ranked_runs = [
+        run for run in selected_runs if primary_metric in overall_by_run[run.run_id]
+    ]
+    ranked_runs.sort(
+        key=lambda run: (
+            (
+                -overall_by_run[run.run_id][primary_metric][0]
+                if direction == "max"
+                else overall_by_run[run.run_id][primary_metric][0]
+            ),
+            run.run_id,
+        )
+    )
+    rendered = []
+    export_rows = []
+    for rank, run in enumerate(ranked_runs, start=1):
+        manifest = run.manifest
+        measurements = overall_by_run[run.run_id]
+        row = {
+            "rank": rank,
+            "run_id": run.run_id,
+            "model": dotted_get(manifest, "model"),
+            "controller_application": manifest.get("model", {}).get(
+                "ca_controller_application"
+            ),
+            "architecture": architecture_signature(manifest),
+            "training_cache": training_cache_label(manifest),
+            "model_seed": dotted_get(manifest, "seed"),
+            "data_seed": dotted_get(manifest, "data_seed"),
+            "checkpoint_step": measurements[primary_metric][1],
+        }
+        values = []
+        for metric in specs:
+            measurement = measurements.get(metric)
+            row[metric] = None if measurement is None else measurement[0]
+            values.append(
+                "—" if measurement is None else f"{measurement[0]:.6f}"
+            )
+        export_rows.append(row)
+        rendered.append(
+            (
+                rank,
+                run.run_id,
+                row["model"],
+                row["controller_application"],
+                row["architecture"],
+                row["training_cache"],
+                row["model_seed"],
+                row["data_seed"],
+                row["checkpoint_step"],
+                *values,
+            )
+        )
+    print(
+        _terminal_table(
+            (
+                "rank",
+                "run",
+                "model",
+                "controller",
+                "architecture",
+                "cache",
+                "seed",
+                "data",
+                "checkpoint step",
+                *(spec.label for spec in specs.values()),
+            ),
+            rendered,
+        )
+    )
+    print(
+        f"\nRanked {direction} by {primary_metric} from "
+        f"{args.split}/{args.checkpoint}; additional selected metrics are "
+        "descriptive and do not affect rank."
+    )
+    if args.output_dir is not None:
+        report_dir = _report_dir(args)
+        _write_csv(report_dir / "delayed_leaderboard.csv", export_rows)
+        write_json(report_dir / "delayed_leaderboard.json", export_rows)
+        write_json(report_dir / "delayed_comparison.json", report)
+        _write_analysis_manifest(report_dir, args, selected_runs)
+        print(f"\nWrote delayed leaderboard to {report_dir}")
+    return 0
+
+
 def _load_plotting(report_dir: Path):
     mpl_config = report_dir / ".matplotlib"
     mpl_config.mkdir(parents=True, exist_ok=True)
@@ -1659,6 +2651,66 @@ def _add_metric_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_delayed_arguments(parser: argparse.ArgumentParser) -> None:
+    _add_discovery_arguments(parser)
+    parser.add_argument(
+        "--run-id",
+        nargs="+",
+        default=None,
+        metavar="RUN_ID",
+        help=(
+            "Exact run IDs to compare, in the requested order. Existing "
+            "--where filters are applied before this selection."
+        ),
+    )
+    parser.add_argument(
+        "--metrics",
+        nargs="+",
+        choices=tuple(DELAYED_METRICS),
+        default=["cell_accuracy", "exact_sequence_accuracy"],
+        metavar="METRIC",
+        help=(
+            "One or two delayed metrics. For a leaderboard, the first metric "
+            "determines rank and the second is descriptive."
+        ),
+    )
+    parser.add_argument(
+        "--split",
+        choices=("validation", "final_test"),
+        default="final_test",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default="best_delayed_recall",
+        help=(
+            "Checkpoint type, normally best_delayed_recall. Use 'none' for "
+            "validation records or 'any' to disable checkpoint filtering."
+        ),
+    )
+    parser.add_argument(
+        "--length",
+        type=int,
+        default=64,
+        help="Evaluated row length.",
+    )
+    parser.add_argument(
+        "--average-over",
+        default="seed,data_seed",
+        help="Comma-separated replicate fields removed during configuration grouping.",
+    )
+    parser.add_argument(
+        "--strict-match",
+        action="store_true",
+        help="Reject rather than warn about mixed delayed-CA protocols.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional directory for delayed comparison CSV/JSON artifacts.",
+    )
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Analyze normalized Rule 30 experiment runs."
@@ -1759,6 +2811,31 @@ def make_parser() -> argparse.ArgumentParser:
         help="Optional directory for leaderboard CSV/JSON and provenance.",
     )
     leaderboard_parser.set_defaults(handler=command_leaderboard)
+
+    delayed_compare_parser = subparsers.add_parser(
+        "delayed-compare",
+        help=(
+            "Compare delayed recall, retrieval, and same-checkpoint CA metrics."
+        ),
+    )
+    _add_delayed_arguments(delayed_compare_parser)
+    delayed_compare_parser.set_defaults(handler=command_delayed_compare)
+
+    delayed_leaderboard_parser = subparsers.add_parser(
+        "delayed-leaderboard",
+        help="Rank individual delayed-CA runs by a nontrivial recall metric.",
+    )
+    _add_delayed_arguments(delayed_leaderboard_parser)
+    delayed_leaderboard_parser.add_argument(
+        "--direction",
+        choices=("auto", "max", "min"),
+        default="auto",
+        help=(
+            "Ranking direction. Auto minimizes loss/rank/error metrics and "
+            "maximizes accuracy/similarity metrics."
+        ),
+    )
+    delayed_leaderboard_parser.set_defaults(handler=command_delayed_leaderboard)
 
     horizon_parser = subparsers.add_parser(
         "plot-horizon", help="Plot performance across steps:repeats pairs."

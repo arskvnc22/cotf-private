@@ -1,35 +1,24 @@
 from optim.runner_utils import (
     InfiniteBatchIterator,
-    add_scalar_metrics,
     infinite_batches,
-    sanitize_for_json,
-    save_model_checkpoint,
     save_training_checkpoint,
 )
-
-from optim.runner_utils import (
-    load_training_checkpoint,
-    make_optimizer,
-    make_scheduler,
-    resolve_resume_checkpoint,
-)
-
-
 from .ca_forward import (
     CAForwardContext,
     CAForwardPolicy,
 )
-
-
 from .soca_gen import rollout_soca
-
-from .ca_reporting import read_json, write_json
+from .soca_exposure import (
+    add_soca_training_exposure,
+    copy_soca_training_exposure,
+    new_soca_step_exposure,
+    new_soca_training_exposure,
+    update_soca_step_exposure,
+)
 
 import copy
-import inspect
 import json
 import math
-import time
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -40,6 +29,7 @@ def _autocast_context(args):
     if args.device.type == "cpu":
         return nullcontext()
     return torch.amp.autocast(device_type="cuda", dtype=args.dtype)
+
 
 def _wandb_log(args, values, step):
     if not getattr(args, "wandb", False):
@@ -56,11 +46,8 @@ def _distributed_mean(value, device, world_size):
     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
     return float((tensor / world_size).item())
 
-def _finite_or(value, fallback):
-    value = float(value)
-    return value if math.isfinite(value) else fallback
 
-def encode_soca_inputs(state_sequence,input_vocab_size):
+def encode_soca_inputs(state_sequence, input_vocab_size):
     if state_sequence.ndim != 2:
         raise ValueError("state_sequence must have shape [B, N].")
 
@@ -101,9 +88,8 @@ def encode_soca_targets(targets_by_repeat, output_vocab_size):
         targets[:, :, row_length:] += 2
         return targets
 
-    raise ValueError(
-        "SOCA output_vocab_size must currently be 2 or 4."
-    )
+    raise ValueError("SOCA output_vocab_size must currently be 2 or 4.")
+
 
 def soca_component_masks(direction_schedule, sequence_length):
     """Return boolean [B, R, N] computed and copied masks."""
@@ -148,6 +134,10 @@ def new_soca_counters(num_repeats, device):
         "reverse_transitions",
         "switch_examples",
         "examples",
+        "forward_correct",
+        "forward_positions",
+        "reverse_correct",
+        "reverse_positions",
     )
     counters = {
         name: torch.zeros((), dtype=torch.long, device=device)
@@ -186,6 +176,14 @@ def update_soca_counters(
         direction_schedule,
         repeat_logits.shape[2],
     )
+    forward_position_mask = (
+        direction_schedule.eq(0).unsqueeze(-1).expand_as(correct)
+    )
+    reverse_position_mask = (
+        direction_schedule.eq(1)
+        .unsqueeze(-1)
+        .expand_as(correct)
+    )
 
     counters["total_correct"] += correct.sum()
     counters["total_positions"] += correct.numel()
@@ -193,6 +191,11 @@ def update_soca_counters(
     counters["computed_positions"] += computed_mask.sum()
     counters["copied_correct"] += (correct & copied_mask).sum()
     counters["copied_positions"] += copied_mask.sum()
+    counters["forward_correct"] += (correct & forward_position_mask).sum()
+    counters["forward_positions"] += forward_position_mask.sum()
+
+    counters["reverse_correct"] += (correct & reverse_position_mask).sum()
+    counters["reverse_positions"] += reverse_position_mask.sum()
 
     exact_states = correct.all(dim=-1)
     counters["exact_states"] += exact_states.sum()
@@ -245,6 +248,15 @@ def finalize_soca_counters(counters):
         "exact_state_accuracy": _safe_counter_ratio(
             counters["exact_states"], counters["states"]
         ),
+        "forward_accuracy": _safe_counter_ratio(
+            counters["forward_correct"],
+            counters["forward_positions"],
+        ),
+        "reverse_accuracy": _safe_counter_ratio(
+            counters["reverse_correct"],
+            counters["reverse_positions"],
+        ),
+
         "forward_transitions": int(counters["forward_transitions"].item()),
         "reverse_transitions": int(counters["reverse_transitions"].item()),
         "switch_examples": int(counters["switch_examples"].item()),
@@ -329,12 +341,64 @@ def soca_loss(
     }
 
 
+@torch.no_grad()
+def evaluate_soca_validation(evaluation_forward, eval_loaders, args):
+    """Evaluate the fixed named validation conditions used by the dry run."""
+    # Keep this import local because soca_eval imports the task encoding helpers
+    # from this module.
+    from .soca_eval import evaluate_soca_model
+
+    results = {}
+    for condition, dataloader in eval_loaders.items():
+        results[str(condition)] = evaluate_soca_model(
+            evaluation_forward,
+            dataloader,
+            args.device,
+            copy_loss_weight=args.soca_copy_loss_weight,
+            target_steps_per_repeat=1,
+            max_batches=args.soca_eval_max_batches,
+            ctx=_autocast_context(args),
+        )
+    if not results:
+        raise ValueError("SOCA validation requires at least one condition loader.")
+    return results
+
+
+def summarize_soca_validation(evaluations):
+    """Return the small scalar subset intended for terminal and W&B logs."""
+    summary = {}
+    for condition, result in evaluations.items():
+        overall = result["overall"]
+        summary[condition] = {
+            "loss": overall["configured_loss"],
+            "state_accuracy": overall["state"]["cell_accuracy"],
+            "exact_state_accuracy": overall["state"]["exact_row_accuracy"],
+            "computed_accuracy": overall["computed"]["cell_accuracy"],
+            "copied_accuracy": overall["copied"]["cell_accuracy"],
+            "joint_pair_cell_accuracy": overall[
+                "joint_pair_cell_accuracy"
+            ],
+            "by_repeat": {
+                repeat: {
+                    "state_accuracy": values["state"]["cell_accuracy"],
+                    "computed_accuracy": values["computed"]["cell_accuracy"],
+                    "copied_accuracy": values["copied"]["cell_accuracy"],
+                    "exact_state_accuracy": values["state"][
+                        "exact_row_accuracy"
+                    ],
+                }
+                for repeat, values in result["by_repeat"].items()
+            },
+        }
+    return summary
+
+
 def soca_train(
     model,
     optimizer,
     scheduler,
     train_loader,
-    eval_loader,
+    eval_loaders,
     test_loader,
     args,
     distributed_backend,
@@ -353,7 +417,7 @@ def soca_train(
     log_every = getattr(args, "soca_log_every", None) or max(
         1, min(100, args.eval_freq)
     )
-    save_every = getattr(args, "soca_save_every", None) or args.eval_freq
+    save_every = getattr(args, "soca_save_every", None) or args.iterations
 
     if args.soca_exact_data_resume:
         batch_iterator = InfiniteBatchIterator(
@@ -368,11 +432,66 @@ def soca_train(
             return batch_iterator.state_dict()
         return {}
 
+    training_exposure = new_soca_training_exposure(
+        materialized_training_rows=len(train_loader.dataset),
+        num_repeats=args.n_repeat,
+        copy_loss_weight=args.soca_copy_loss_weight,
+    )
+    evaluation_history = {}
+    last_checkpoint_step = None
+
+    def evaluate(completed_step):
+        evaluations = evaluate_soca_validation(
+            evaluation_forward,
+            eval_loaders,
+            args,
+        )
+        summary = summarize_soca_validation(evaluations)
+        evaluation_history[str(completed_step)] = {
+            "conditions": evaluations,
+            "training_exposure": copy_soca_training_exposure(
+                training_exposure
+            ),
+        }
+        if distributed_backend.is_master_process():
+            print(
+                json.dumps(
+                    {
+                        "step": int(completed_step),
+                        "validation": summary,
+                        "training_exposure": copy_soca_training_exposure(
+                            training_exposure
+                        ),
+                    }
+                ),
+                flush=True,
+            )
+            logs = {"step": int(completed_step)}
+            for condition, condition_summary in summary.items():
+                for name in (
+                    "loss",
+                    "state_accuracy",
+                    "exact_state_accuracy",
+                    "computed_accuracy",
+                    "copied_accuracy",
+                    "joint_pair_cell_accuracy",
+                ):
+                    value = condition_summary[name]
+                    if value is not None:
+                        logs[f"val/{condition}/{name}"] = float(value)
+                for repeat, repeat_summary in condition_summary[
+                    "by_repeat"
+                ].items():
+                    for name, value in repeat_summary.items():
+                        if value is not None:
+                            logs[
+                                f"val/{condition}/{repeat}/{name}"
+                            ] = float(value)
+            _wandb_log(args, logs, completed_step)
+
+    evaluate(start_step)
+
     for step in range(start_step, args.iterations):
-        if step % args.eval_freq == 0:
-            # TODO Call SOCA evaluator.
-            # TODO Select/save best checkpoint on validation metrics.
-            pass
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
@@ -381,6 +500,7 @@ def soca_train(
         accumulated_computed_loss = 0.0
         accumulated_copied_loss = 0.0
         step_counters = None
+        step_exposure = new_soca_step_exposure(args.n_repeat)
 
         for microstep_index in range(args.acc_steps):
             batch = next(batch_iterator)
@@ -393,6 +513,11 @@ def soca_train(
                 args.device,
                 dtype=torch.long,
                 non_blocking=pin_memory,
+            )
+            update_soca_step_exposure(
+                step_exposure,
+                state_sequence,
+                direction_schedule,
             )
 
             with torch.no_grad():
@@ -471,6 +596,7 @@ def soca_train(
             scheduler.step()
 
         completed_step = step + 1
+        add_soca_training_exposure(training_exposure, step_exposure)
         mean_loss = _distributed_mean(
             accumulated_loss / args.acc_steps,
             args.device,
@@ -501,6 +627,8 @@ def soca_train(
                 "train/grad_norm": grad_norm,
                 "train/accuracy": train_metrics["accuracy"],
                 "train/computed_accuracy": train_metrics["computed_accuracy"],
+                "train/forward_accuracy": train_metrics["forward_accuracy"],
+                "train/reverse_accuracy": train_metrics["reverse_accuracy"],
                 "train/copied_accuracy": train_metrics["copied_accuracy"],
                 "train/exact_state_accuracy": train_metrics[
                     "exact_state_accuracy"
@@ -520,9 +648,42 @@ def soca_train(
                     logs[
                         f"train/{role}_accuracy_repeat_{repeat_index}"
                     ] = accuracy
+            exposure_snapshot = copy_soca_training_exposure(
+                training_exposure
+            )
+            logs["exposure/examples"] = exposure_snapshot[
+                "total_examples_seen"
+            ]
+            logs["exposure/supervised_states"] = exposure_snapshot[
+                "total_supervised_states"
+            ]
+            logs["exposure/equivalent_dataset_passes"] = exposure_snapshot[
+                "equivalent_dataset_passes"
+            ]
+            for repeat, values in exposure_snapshot["by_repeat"].items():
+                logs[f"exposure/{repeat}/forward_fraction"] = values[
+                    "forward_fraction"
+                ]
+                logs[f"exposure/{repeat}/reverse_fraction"] = values[
+                    "reverse_fraction"
+                ]
             if distributed_backend.is_master_process():
-                print(json.dumps(logs), flush=True)
+                print(
+                    json.dumps(
+                        {
+                            **logs,
+                            "training_exposure": exposure_snapshot,
+                        }
+                    ),
+                    flush=True,
+                )
                 _wandb_log(args, logs, completed_step)
+
+        if (
+            completed_step % args.eval_freq == 0
+            or completed_step == args.iterations
+        ):
+            evaluate(completed_step)
 
         if completed_step % save_every == 0:
             save_training_checkpoint(
@@ -534,13 +695,19 @@ def soca_train(
                 distributed_backend=distributed_backend,
                 data_state=current_data_state(),
             )
+            last_checkpoint_step = completed_step
 
-    save_training_checkpoint(
-        checkpoint_dir / f"ckpt_{args.iterations}.pt",
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        step=args.iterations,
-        distributed_backend=distributed_backend,
-        data_state=current_data_state(),
-    )
+    if last_checkpoint_step != args.iterations:
+        save_training_checkpoint(
+            checkpoint_dir / f"ckpt_{args.iterations}.pt",
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            step=args.iterations,
+            distributed_backend=distributed_backend,
+            data_state=current_data_state(),
+        )
+    return {
+        "evaluation_history": evaluation_history,
+        "training_exposure": copy_soca_training_exposure(training_exposure),
+    }

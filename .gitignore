@@ -29,17 +29,6 @@ __pycache__/
 # Reference PDFs (paper, etc.)
 refs/
 
-# Huge att diagnositcs
-ca-attention-diagnostics/
-
-# intervention results lot of pngs
-
-downloads/
-
-# run artifcats
-iridis/ca-rule30/runs/
-
-
 # Distribution / packaging
 .Python
 build/
@@ -168,12 +157,22 @@ dmypy.json
 # Slurm files
 slurm_*.out
 slurm_*.err
+# Large generated diagnostics and experiment outputs
+ca-attention-diagnostics/
+downloads/
+iridis/ca-rule30/runs/
+iridis/dca-30/runs/
+
+# Scheduler output
 gpu_test_*.out
 gpu_test_*.err
+
+# LaTeX build artifacts
 *.aux
 *.blg
 *.fdb_latexmk
 *.fls
 *.synctex.gz
 *.run.xml
-
+ca-attention-diagnostics/
+downloads/

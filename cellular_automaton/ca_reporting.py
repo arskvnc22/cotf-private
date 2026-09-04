@@ -164,6 +164,8 @@ def build_run_manifest(
         "sequence_length",
         "attention_mode",
         "attention_implementation",
+        "ca_max_relative_age",
+        "ca_controller_application",
         "positional_encoder",
         "n_layer_begin",
         "n_layer_end",
@@ -196,6 +198,9 @@ def build_run_manifest(
         "beta2",
         "grad_clip",
         "batch_size",
+        "ca_delayed_percentage",
+        "query_horizon_policy",
+        "ca_query_loss_weight",
         "iterations",
         "scheduler",
         "final_div_factor",
@@ -342,7 +347,7 @@ def _metric_items(metrics: Any) -> Iterable[tuple[str, int | float]]:
 
 def _parse_repeat(value: str | int) -> int:
     text = str(value)
-    return int(text.removeprefix("repeats_"))
+    return int(text.removeprefix("repeats_").removeprefix("repeat_"))
 
 
 def _parse_horizon(value: str | int) -> int:
@@ -471,6 +476,19 @@ def _default_training_pair(manifest: Mapping[str, Any]) -> tuple[int, int]:
     if not pairs:
         return 1, 1
     return int(pairs[0]["ca_steps"]), int(pairs[0]["num_repeats"])
+
+
+def _delayed_recall_length(
+    manifest: Mapping[str, Any], checkpoint: Any = None
+) -> int | None:
+    if isinstance(checkpoint, Mapping) and checkpoint.get("length") is not None:
+        return int(checkpoint["length"])
+    resolved_args = manifest.get("resolved_args", {})
+    if isinstance(resolved_args, Mapping):
+        length = resolved_args.get("ca_best_length")
+        if length is not None:
+            return int(length)
+    return None
 
 
 def _append_in_distribution(
@@ -723,7 +741,7 @@ def _append_training_exposure(
     totals = {
         key: value
         for key, value in exposure.items()
-        if key != "by_training_pair"
+        if key not in {"by_mode", "by_training_pair"}
     }
     totals["accounting_exact"] = int(bool(exposure.get("accounting_exact", False)))
     _append_metrics(
@@ -734,13 +752,30 @@ def _append_training_exposure(
         data_split="training",
         evaluation_role="training_exposure",
     )
+    for mode, metrics in exposure.get("by_mode", {}).items():
+        if not isinstance(metrics, Mapping):
+            continue
+        _append_metrics(
+            records,
+            manifest,
+            metrics,
+            step=step,
+            data_split="training",
+            evaluation_role=f"training_exposure_{mode}",
+        )
     for pair in exposure.get("by_training_pair", {}).values():
         if not isinstance(pair, Mapping):
             continue
         metrics = {
             key: value
             for key, value in pair.items()
-            if key not in {"ca_steps", "num_repeats"}
+            if key
+            not in {
+                "ca_steps",
+                "num_repeats",
+                "by_mode",
+                "delayed_by_query_repeat",
+            }
         }
         _append_metrics(
             records,
@@ -751,6 +786,236 @@ def _append_training_exposure(
             evaluation_role="training_exposure_by_pair",
             ca_steps=int(pair["ca_steps"]),
             num_repeats=int(pair["num_repeats"]),
+        )
+        for mode, mode_metrics in pair.get("by_mode", {}).items():
+            if not isinstance(mode_metrics, Mapping):
+                continue
+            _append_metrics(
+                records,
+                manifest,
+                mode_metrics,
+                step=step,
+                data_split="training",
+                evaluation_role=f"training_exposure_by_pair_{mode}",
+                ca_steps=int(pair["ca_steps"]),
+                num_repeats=int(pair["num_repeats"]),
+            )
+        for query in pair.get("delayed_by_query_repeat", {}).values():
+            if not isinstance(query, Mapping):
+                continue
+            query_repeat = int(query["query_repeat"])
+            query_metrics = {
+                key: value
+                for key, value in query.items()
+                if key not in {"query_repeat", "recall_age", "target_steps"}
+            }
+            _append_metrics(
+                records,
+                manifest,
+                query_metrics,
+                step=step,
+                data_split="training",
+                evaluation_role="training_exposure_delayed_query",
+                ca_steps=int(pair["ca_steps"]),
+                num_repeats=int(pair["num_repeats"]),
+                repeat_from=query_repeat,
+                repeat_to=int(pair["num_repeats"]),
+            )
+
+
+def _append_delayed_recall(
+    records: list[dict[str, Any]],
+    manifest: Mapping[str, Any],
+    delayed_recall: Any,
+    *,
+    step: int | None,
+    data_split: str,
+    checkpoint_type: str | None = None,
+    length: int | None = None,
+) -> None:
+    """Normalize delayed recall, all-repeat retrieval, and collision metrics."""
+    if not isinstance(delayed_recall, Mapping):
+        return
+
+    for pair in delayed_recall.values():
+        if not isinstance(pair, Mapping) or "queries" not in pair:
+            continue
+        ca_steps = int(pair["ca_steps"])
+        num_repeats = int(pair["num_repeats"])
+        for query in pair["queries"].values():
+            if not isinstance(query, Mapping):
+                continue
+            query_repeat = int(query["query_repeat"])
+            common = {
+                "step": step,
+                "data_split": data_split,
+                "checkpoint_type": checkpoint_type,
+                "length": length,
+                "ca_steps": ca_steps,
+                "num_repeats": num_repeats,
+                "repeat_from": query_repeat,
+            }
+            _append_metrics(
+                records,
+                manifest,
+                query.get("metrics", {}),
+                evaluation_role="delayed_recall_ground_truth_requested",
+                repeat_to=query_repeat,
+                **common,
+            )
+            _append_metrics(
+                records,
+                manifest,
+                query.get("ground_truth_retrieval", {}),
+                evaluation_role="delayed_recall_ground_truth_retrieval",
+                repeat_to=None,
+                **common,
+            )
+            for candidate_key, metrics in query.get(
+                "ground_truth_comparison_by_repeat", {}
+            ).items():
+                _append_metrics(
+                    records,
+                    manifest,
+                    metrics,
+                    evaluation_role="delayed_recall_ground_truth_candidate",
+                    repeat_to=_parse_repeat(candidate_key),
+                    **common,
+                )
+            for candidate_key, metrics in query.get(
+                "ground_truth_state_collision_by_repeat", {}
+            ).items():
+                _append_metrics(
+                    records,
+                    manifest,
+                    metrics,
+                    evaluation_role="delayed_recall_ground_truth_collision",
+                    repeat_to=_parse_repeat(candidate_key),
+                    **common,
+                )
+
+            internal = query.get("internal_consistency", {})
+            if not isinstance(internal, Mapping):
+                continue
+            _append_metrics(
+                records,
+                manifest,
+                internal.get("decoded_requested_repeat", {}),
+                evaluation_role="delayed_recall_internal_decoded_requested",
+                repeat_to=query_repeat,
+                **common,
+            )
+            for field, role in (
+                (
+                    "decoded_comparison_by_repeat",
+                    "delayed_recall_internal_decoded_candidate",
+                ),
+                (
+                    "decoded_state_collision_by_repeat",
+                    "delayed_recall_internal_decoded_collision",
+                ),
+                (
+                    "logit_similarity_by_repeat",
+                    "delayed_recall_internal_logit_similarity",
+                ),
+            ):
+                for candidate_key, metrics in internal.get(field, {}).items():
+                    _append_metrics(
+                        records,
+                        manifest,
+                        metrics,
+                        evaluation_role=role,
+                        repeat_to=_parse_repeat(candidate_key),
+                        **common,
+                    )
+            for field, role in (
+                (
+                    "decoded_retrieval",
+                    "delayed_recall_internal_decoded_retrieval",
+                ),
+                ("cosine_retrieval", "delayed_recall_cosine_retrieval"),
+            ):
+                _append_metrics(
+                    records,
+                    manifest,
+                    internal.get(field, {}),
+                    evaluation_role=role,
+                    repeat_to=None,
+                    **common,
+                )
+
+        for field, role in (
+            ("all_queries_macro", "delayed_recall_all_queries_macro"),
+            (
+                "nontrivial_queries_macro",
+                "delayed_recall_nontrivial_queries_macro",
+            ),
+            (
+                "all_queries_internal_consistency_macro",
+                "delayed_recall_all_internal_macro",
+            ),
+            (
+                "nontrivial_internal_consistency_macro",
+                "delayed_recall_nontrivial_internal_macro",
+            ),
+            (
+                "all_queries_ground_truth_retrieval_macro",
+                "delayed_recall_all_ground_truth_retrieval_macro",
+            ),
+            (
+                "nontrivial_ground_truth_retrieval_macro",
+                "delayed_recall_nontrivial_ground_truth_retrieval_macro",
+            ),
+        ):
+            _append_metrics(
+                records,
+                manifest,
+                pair.get(field, {}),
+                step=step,
+                data_split=data_split,
+                evaluation_role=role,
+                checkpoint_type=checkpoint_type,
+                length=length,
+                ca_steps=ca_steps,
+                num_repeats=num_repeats,
+            )
+
+
+def _append_delayed_recall_summary(
+    records: list[dict[str, Any]],
+    manifest: Mapping[str, Any],
+    summary: Any,
+    *,
+    step: int | None,
+    data_split: str,
+    checkpoint_type: str | None = None,
+    length: int | None = None,
+) -> None:
+    if not isinstance(summary, Mapping):
+        return
+    for field, role in (
+        (
+            "nontrivial_queries_pair_macro",
+            "delayed_recall_nontrivial_pair_macro",
+        ),
+        (
+            "nontrivial_internal_consistency_pair_macro",
+            "delayed_recall_nontrivial_internal_pair_macro",
+        ),
+        (
+            "nontrivial_ground_truth_retrieval_pair_macro",
+            "delayed_recall_nontrivial_ground_truth_retrieval_pair_macro",
+        ),
+    ):
+        _append_metrics(
+            records,
+            manifest,
+            summary.get(field, {}),
+            step=step,
+            data_split=data_split,
+            evaluation_role=role,
+            checkpoint_type=checkpoint_type,
+            length=length,
         )
 
 
@@ -833,6 +1098,23 @@ def normalize_training_stats(
             step=step,
             data_split="validation",
         )
+        delayed_length = _delayed_recall_length(manifest)
+        _append_delayed_recall(
+            records,
+            manifest,
+            evaluation.get("delayed_recall", {}),
+            step=step,
+            data_split="validation",
+            length=delayed_length,
+        )
+        _append_delayed_recall_summary(
+            records,
+            manifest,
+            evaluation.get("delayed_recall_summary", {}),
+            step=step,
+            data_split="validation",
+            length=delayed_length,
+        )
         _append_training_exposure(
             records,
             manifest,
@@ -842,6 +1124,7 @@ def normalize_training_stats(
 
     canonical_checkpoints = (
         "best_id",
+        "best_delayed_recall",
         "best_extrapolation_strict",
         "best_extrapolation_unconstrained",
     )
@@ -875,6 +1158,25 @@ def normalize_training_stats(
             step=step,
             data_split="final_test",
             checkpoint_type=checkpoint_type,
+        )
+        delayed_length = _delayed_recall_length(manifest, checkpoint)
+        _append_delayed_recall(
+            records,
+            manifest,
+            analysis.get("delayed_recall", {}),
+            step=step,
+            data_split="final_test",
+            checkpoint_type=checkpoint_type,
+            length=delayed_length,
+        )
+        _append_delayed_recall_summary(
+            records,
+            manifest,
+            analysis.get("delayed_recall_summary", {}),
+            step=step,
+            data_split="final_test",
+            checkpoint_type=checkpoint_type,
+            length=delayed_length,
         )
 
     sort_fields = (

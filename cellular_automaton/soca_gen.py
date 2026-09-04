@@ -14,7 +14,7 @@ from .ca_gen import rule30
 FORWARD = 0
 REVERSE = 1
 _MAX_TORCH_SEED = 2**63 - 1
-debug = True
+debug = False
 def printifdeb(statement):
     if debug == True:
         print(statement)

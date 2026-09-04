@@ -39,6 +39,78 @@ def write_sample_run(root, number, seed, data_seed, accuracy):
     return run_dir
 
 
+def write_delayed_run(
+    root,
+    number,
+    *,
+    seed,
+    data_seed,
+    cell_accuracy,
+    exact_accuracy,
+    loss,
+    controller="persistent",
+    delayed_percentage=75,
+):
+    run_dir = root / f"run_{number}__dca_but_{controller}"
+    args = sample_args(seed=seed, data_seed=data_seed)
+    args.update(
+        {
+            "model": "dca_but",
+            "ca_controller_application": controller,
+            "ca_max_relative_age": 3,
+            "ca_delayed_percentage": delayed_percentage,
+            "query_horizon_policy": "uniform",
+            "ca_query_loss_weight": 2.0,
+            "ca_delayed_best_metric": "cell_accuracy",
+            "ca_boundary": "periodic",
+            "ca_bernoulli_p": 0.5,
+            "ca_exact_data_resume": True,
+            "ca_shuffle_seed": data_seed,
+            "scheduler": "none",
+            "eval_freq": 50,
+            "lm_cache": "none",
+            "repeat_cache_window": None,
+        }
+    )
+    manifest = build_run_manifest(args, run_dir, root / "checkpoints")
+    write_run_manifest(run_dir, manifest)
+    stats = sample_stats()
+    replacement = {
+        "loss": loss,
+        "cell_accuracy": cell_accuracy,
+        "exact_sequence_accuracy": exact_accuracy,
+        "matthews_correlation": cell_accuracy,
+        "mean_bit_errors_per_sequence": 64 * (1.0 - cell_accuracy),
+    }
+    delayed_locations = [
+        stats["eval"]["50"],
+        stats["checkpoint_analysis"]["best_delayed_recall"],
+    ]
+    for location in delayed_locations:
+        pair = location["delayed_recall"]["steps_3_repeats_3"]
+        pair["nontrivial_queries_macro"].update(replacement)
+        pair["queries"]["query_repeat_1"]["metrics"].update(replacement)
+        location["delayed_recall_summary"][
+            "nontrivial_queries_pair_macro"
+        ].update(replacement)
+    stats["checkpoint_analysis"]["best_delayed_recall"]["task_metrics"] = {
+        "in_distribution": {
+            "steps_3_repeats_3": {
+                "ca_steps": 3,
+                "num_repeats": 3,
+                "by_length": {
+                    "64": {
+                        **replacement,
+                        "cell_accuracy": min(1.0, cell_accuracy + 0.05),
+                    }
+                },
+            }
+        }
+    }
+    write_eval_metrics(run_dir, stats)
+    return run_dir
+
+
 def write_validation_run(
     root,
     number,
@@ -622,6 +694,272 @@ def test_leaderboard_warns_about_mixed_evaluation_protocols(tmp_path, capsys):
     assert "WARNING: mixed evaluation protocols" in output
     assert "P1" in output
     assert "P2" in output
+
+
+def test_delayed_compare_streams_selected_metrics_and_writes_artifacts(
+    tmp_path, capsys, monkeypatch
+):
+    runs_root = tmp_path / "runs"
+    first = write_delayed_run(
+        runs_root,
+        1,
+        seed=1,
+        data_seed=11,
+        cell_accuracy=0.8,
+        exact_accuracy=0.4,
+        loss=0.3,
+        controller="persistent",
+    )
+    second = write_delayed_run(
+        runs_root,
+        2,
+        seed=1,
+        data_seed=11,
+        cell_accuracy=0.9,
+        exact_accuracy=0.6,
+        loss=0.2,
+        controller="subtract",
+    )
+    output_dir = tmp_path / "delayed"
+    original_iter_metrics = ca_analyze.iter_metrics
+    calls = []
+
+    def counted_stream(path):
+        calls.append(path)
+        yield from original_iter_metrics(path)
+
+    def reject_eager_loading(path):
+        raise AssertionError(f"eagerly loaded metrics from {path}")
+
+    monkeypatch.setattr(ca_analyze, "iter_metrics", counted_stream)
+    monkeypatch.setattr(ca_analyze, "read_metrics", reject_eager_loading)
+
+    assert main(
+        [
+            "delayed-compare",
+            "--runs",
+            str(runs_root),
+            "--run-id",
+            first.name,
+            second.name,
+            "--metrics",
+            "cell_accuracy",
+            "exact_sequence_accuracy",
+            "--output-dir",
+            str(output_dir),
+        ]
+    ) == 0
+    output = capsys.readouterr().out
+    assert "Overall nontrivial delayed recall" in output
+    assert "query_repeat" in output
+    assert "recall_age" in output
+    assert "is_no_op" in output
+    assert "internal cell" not in output
+    assert len(calls) == 2
+    assert {path.parent.name for path in calls} == {first.name, second.name}
+
+    report = json.loads(
+        (output_dir / "delayed_comparison.json").read_text(encoding="utf-8")
+    )
+    assert {row["metric"] for row in report["overall"]} == {
+        "cell_accuracy",
+        "exact_sequence_accuracy",
+    }
+    query = next(
+        row
+        for row in report["queries"]
+        if row["query_repeat"] == 1 and row["metric"] == "cell_accuracy"
+    )
+    assert query["horizon"] == 3
+    assert query["recall_age"] == 2
+    assert query["is_no_op"] is False
+    assert report["protocol_count"] == 1
+    for filename in (
+        "delayed_summary.csv",
+        "delayed_horizons.csv",
+        "delayed_queries.csv",
+        "delayed_candidates.csv",
+        "delayed_validation.csv",
+        "delayed_comparison.json",
+        "analysis_manifest.json",
+    ):
+        assert (output_dir / filename).is_file()
+    horizon_export = (output_dir / "delayed_horizons.csv").read_text(
+        encoding="utf-8"
+    )
+    assert "delayed_nontrivial" in horizon_export
+    assert "in_distribution_same_checkpoint" in horizon_export
+    candidate_rows = (output_dir / "delayed_candidates.csv").read_text(
+        encoding="utf-8"
+    )
+    assert "delayed_recall_ground_truth_candidate" in candidate_rows
+    assert "delayed_recall_internal_logit_similarity" in candidate_rows
+
+
+def test_delayed_compare_accepts_one_metric_and_rejects_more_than_two(
+    tmp_path, capsys
+):
+    runs_root = tmp_path / "runs"
+    write_delayed_run(
+        runs_root,
+        1,
+        seed=1,
+        data_seed=11,
+        cell_accuracy=0.8,
+        exact_accuracy=0.4,
+        loss=0.3,
+    )
+    assert main(
+        [
+            "delayed-compare",
+            "--runs",
+            str(runs_root),
+            "--metrics",
+            "cell_accuracy",
+        ]
+    ) == 0
+    output = capsys.readouterr().out
+    overall_header = output.split("Overall nontrivial delayed recall", 1)[1]
+    assert "cell" in overall_header
+    assert "exact" not in overall_header
+
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "delayed-compare",
+                "--runs",
+                str(runs_root),
+                "--metrics",
+                "cell_accuracy",
+                "exact_sequence_accuracy",
+                "loss",
+            ]
+        )
+    assert error.value.code == 2
+    assert "one or two" in capsys.readouterr().err
+
+
+def test_delayed_compare_aggregates_replicate_seeds(tmp_path):
+    runs_root = tmp_path / "runs"
+    write_delayed_run(
+        runs_root,
+        1,
+        seed=1,
+        data_seed=11,
+        cell_accuracy=0.7,
+        exact_accuracy=0.3,
+        loss=0.4,
+    )
+    write_delayed_run(
+        runs_root,
+        2,
+        seed=2,
+        data_seed=12,
+        cell_accuracy=0.9,
+        exact_accuracy=0.5,
+        loss=0.2,
+    )
+    runs = discover_runs(runs_root, load_metrics=False)
+    args = Namespace(
+        metrics=["cell_accuracy"],
+        run_id=None,
+        split="final_test",
+        checkpoint="best_delayed_recall",
+        length=64,
+        average_over="seed,data_seed",
+        strict_match=False,
+    )
+    _selected, _specs, _raw, report = ca_analyze._build_delayed_report(
+        args, runs
+    )
+    assert len(report["configurations"]) == 1
+    assert len(report["overall"]) == 1
+    assert report["overall"][0]["n"] == 2
+    assert report["overall"][0]["mean"] == pytest.approx(0.8)
+
+
+def test_delayed_compare_strict_protocol_match_rejects_mismatch(
+    tmp_path, capsys
+):
+    runs_root = tmp_path / "runs"
+    write_delayed_run(
+        runs_root,
+        1,
+        seed=1,
+        data_seed=11,
+        cell_accuracy=0.8,
+        exact_accuracy=0.4,
+        loss=0.3,
+        delayed_percentage=50,
+    )
+    write_delayed_run(
+        runs_root,
+        2,
+        seed=1,
+        data_seed=11,
+        cell_accuracy=0.9,
+        exact_accuracy=0.6,
+        loss=0.2,
+        controller="subtract",
+        delayed_percentage=75,
+    )
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "delayed-compare",
+                "--runs",
+                str(runs_root),
+                "--strict-match",
+            ]
+        )
+    assert error.value.code == 2
+    assert "requires one delayed-CA protocol" in capsys.readouterr().err
+
+
+def test_delayed_leaderboard_uses_first_metric_and_auto_direction(
+    tmp_path, capsys
+):
+    runs_root = tmp_path / "runs"
+    first = write_delayed_run(
+        runs_root,
+        1,
+        seed=1,
+        data_seed=11,
+        cell_accuracy=0.8,
+        exact_accuracy=0.4,
+        loss=0.3,
+    )
+    second = write_delayed_run(
+        runs_root,
+        2,
+        seed=2,
+        data_seed=12,
+        cell_accuracy=0.7,
+        exact_accuracy=0.3,
+        loss=0.1,
+    )
+    output_dir = tmp_path / "leaderboard"
+    assert main(
+        [
+            "delayed-leaderboard",
+            "--runs",
+            str(runs_root),
+            "--metrics",
+            "loss",
+            "cell_accuracy",
+            "--output-dir",
+            str(output_dir),
+        ]
+    ) == 0
+    output = capsys.readouterr().out
+    assert output.index(second.name) < output.index(first.name)
+    assert "Ranked min by loss" in output
+    rows = json.loads(
+        (output_dir / "delayed_leaderboard.json").read_text(encoding="utf-8")
+    )
+    assert rows[0]["run_id"] == second.name
+    assert rows[0]["loss"] == pytest.approx(0.1)
+    assert rows[0]["cell_accuracy"] == pytest.approx(0.7)
 
 
 def test_cli_writes_tables_and_all_plot_types(tmp_path):
