@@ -301,10 +301,25 @@ class GPTBase(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, get_logits=False, use_cache=False, iter=None,log_metrics=False):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        get_logits=False,
+        use_cache=False,
+        iter=None,
+        log_metrics=False,
+        return_attention_trace=False,
+    ):
         device = idx.device
         b, t = idx.size()
         diag_metrics = {} # We will pack everything into a dict to keep it clean
+        # Full attention is O(T^2 * repeats) and quickly becomes too large to
+        # retain for a diagnostic dataset.  The p-hop prediction is read from
+        # the final sequence position, so retain only that query's attention
+        # row after each repeat.  Each entry has shape (B, H, repeat * T); the
+        # key axis is ordered as one T-token chunk per cached repeat.
+        attention_trace = [] if return_attention_trace else None
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
         if log_metrics:
             self.backward_metrics = {}
@@ -314,7 +329,7 @@ class GPTBase(nn.Module):
         
         # forward the GPT model itself
         if use_cache:
-            idx, index_shift, cache_context = self.lm_cache(idx)
+            idx, index_shift, cache_context = self.lm_cache(idx)     # why
         else:
             index_shift = 0
             cache_context = None
@@ -333,7 +348,7 @@ class GPTBase(nn.Module):
 
         total_expected_length = self.n_repeat * T
         for block in self.transformer.h_mid:                      # IMPORTANT: only initialise CoT cache for repeat blocks. EVERY SINGLE BLOCK has its own CoT cache and every single block can attend to past representations of that block only
-            block.attn.init_cache(total_expected_length)
+            block.attn.init_cache(total_expected_length)            # record requested capacity
         if not self.training:
             x_into_mid = x.clone().detach() # We log the x going into mid blocks
         sum_active = 0
@@ -349,6 +364,27 @@ class GPTBase(nn.Module):
             
             for block in self.transformer.h_mid:
                 x = block(x, pos_emb_closure, cache_context, start_index=index_shift)        # for logit lens or something similar take the current hidden state x, pass it through the final layer norm (i assume self.transformer.ln_f(x)) and shove that through the lm head prematurely (we do this to empirically measure representations getting more mature or ritcher or whatever you wanna call it)
+            if return_attention_trace:
+                if self.training:
+                    raise ValueError("Attention tracing is only supported in eval mode.")
+                if not self.transformer.h_mid:
+                    raise ValueError(
+                        "Attention tracing requires at least one repeated middle block."
+                    )
+                final_query_attention = (
+                    self.transformer.h_mid[-1]
+                    .attn.diagnose_attn[:, :, -1, :]
+                    .detach()
+                    .clone()
+                )
+                expected_key_length = rep_idx * T
+                if final_query_attention.shape[-1] != expected_key_length:
+                    raise RuntimeError(
+                        "Unexpected cached-attention key length at repeat "
+                        f"{rep_idx}: got {final_query_attention.shape[-1]}, "
+                        f"expected {expected_key_length}."
+                    )
+                attention_trace.append(final_query_attention)
             if log_metrics:
                 curr_x_last = x[:, -1, :].clone().detach() # we take the last token in the sequence 
                 # pre ln var
@@ -474,7 +510,8 @@ class GPTBase(nn.Module):
                 'sim_of_xs': sim_of_xs if not self.training else None,   # NEW
                 'var_into': var_into if not self.training else None,       #NEW
                 'var_outof': var_outof if not self.training else None,          #NEW 
-                'diag_metrics': diag_metrics if not self.training else None          #NEW 
+                'diag_metrics': diag_metrics if not self.training else None,          #NEW
+                'attention_trace': attention_trace,
                 }
 
     def clear_state(self):

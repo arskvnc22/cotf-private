@@ -156,6 +156,15 @@ def training_pair_for_step(train_pairs, step):
     return tuple(train_pairs[step % len(train_pairs)])
 
 
+def should_run_scheduled_evaluation(step, eval_freq):
+    """Evaluate trained states at positive multiples of the evaluation period."""
+    if step < 0:
+        raise ValueError("Training step cannot be negative.")
+    if eval_freq <= 0:
+        raise ValueError("Evaluation frequency must be positive.")
+    return step > 0 and step % eval_freq == 0
+
+
 def _write_json(path, value):
     path = Path(path)
     temporary_path = path.with_suffix(path.suffix + ".tmp")
@@ -765,7 +774,7 @@ def train_ca(
         distributed_backend.sync()
 
     for step in range(start_step, args.iterations):
-        if step % args.eval_freq == 0:
+        if should_run_scheduled_evaluation(step, args.eval_freq):
             evaluate_and_maybe_select(step)
 
         model.train()

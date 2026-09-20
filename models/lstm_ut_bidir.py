@@ -16,27 +16,50 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from . import positional_encoders, caches
+from .utils import LayerNorm
+
+class InPlaceSetSlice(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, full_tensor, last_slice, x_val, dim):
+        
+        if last_slice is None:
+            prev_length = 0
+        else:
+            prev_length = last_slice.shape[dim]
+        new_length = prev_length + x_val.shape[dim]
+
+        prefix_slice = [slice(None)] * dim 
+        full_tensor[prefix_slice + [slice(prev_length, new_length)]] = x_val
+        ctx.prev_length = prev_length
+        ctx.new_length = new_length
+        ctx.dim = dim
+        ret = torch.Tensor().to(full_tensor)
+        ret.set_(full_tensor[prefix_slice +[slice(None,new_length)]])
+        return ret
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        prefix_slice = [slice(None)] * ctx.dim 
+        if ctx.prev_length == 0:
+            return None, None, grad_out[prefix_slice + [slice(None, ctx.new_length)]], None
+        else:
+            return None, grad_out[prefix_slice + [slice(None, ctx.prev_length)]], grad_out[prefix_slice + [slice(ctx.prev_length, ctx.new_length)]], None
 
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
-
-    def __init__(self, ndim, bias):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
-
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+def apply_inplace_set(x_acc, x_val, dim):
+    full_tensor, last_slice = x_acc
+    new_slice = InPlaceSetSlice.apply(full_tensor, last_slice, x_val, dim)
+    return full_tensor, new_slice
 
 
-class CausalSelfAttention(nn.Module):
+class CausalSelfAttention(nn.Module): # rather confusingly named. we can use bidirectional attention in this as well.,
 
     def __init__(self, config, lm_cache):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.q_attn = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
@@ -74,7 +97,8 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        q = self.q_attn(x)
+        k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -99,8 +123,8 @@ class CausalSelfAttention(nn.Module):
                 k,
                 v,
                 attn_mask=None,
-                dropout_p=self.dropout,
-                is_causal=self.is_causal,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=self.is_causal,         # should be false when using bidirectional
             )
         else:
             # manual implementation of attention
@@ -135,6 +159,7 @@ class CausalSelfAttention(nn.Module):
         return y
 
 
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -152,20 +177,206 @@ class MLP(nn.Module):
         return x
 
 
+# class Block(nn.Module):
+
+#     def __init__(self, config, lm_cache):
+#         super().__init__()
+#         self.config = config
+#         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+#         self.attn = CausalSelfAttention(config, lm_cache)
+#         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+#         self.mlp = MLP(config)
+#         self.memory_gate_norm = nn.LayerNorm(config.n_embd)
+
+#         self.x_to_forget = nn.Linear(config.n_embd,config.n_embd,bias=config.x_to_forget_bias)
+#         self.h_to_forget = nn.Linear(config.n_embd,config.n_embd,bias=config.h_to_forget_bias)
+
+#         self.x_to_write = nn.Linear(config.n_embd,config.n_embd,bias=config.x_to_write_bias)
+#         self.h_to_write = nn.Linear(config.n_embd,config.n_embd,bias=config.h_to_write_bias)
+
+#         self.x_to_memory_proposal = nn.Linear(config.n_embd,config.n_embd,bias=config.x_to_memory_proposal_bias)
+#         self.h_to_memory_proposal = nn.Linear(config.n_embd,config.n_embd,bias=config.h_to_memory_proposal_bias)
+
+#         self.x_to_hidden = nn.Linear(config.n_embd,config.n_embd,bias=config.add_to_hidden_bias)
+#         self.h_to_hidden = nn.Linear(config.n_embd,config.n_embd,bias=config.add_to_hidden_bias)
+
+
+#     def forward(self, x, c, pos_emb_closure, cache_context, start_index, indices=None):
+#         previous_hidden=self.memory_gate_norm(x)
+#         x = x + self.attn(self.ln_1(x), pos_emb_closure, cache_context, start_index)
+#         x = x + self.mlp(self.ln_2(x))
+#         proposed_hidden = self.memory_gate_norm(x)
+
+#         forget_gate = torch.sigmoid(self.x_to_forget(previous_hidden) + self.h_to_forget(proposed_hidden))
+
+#         retained_memory = forget_gate*c
+
+#         write_gate = torch.sigmoid(self.x_to_write(previous_hidden) + self.h_to_write(proposed_hidden))
+
+#         memory_proposal = torch.tanh(self.x_to_memory_proposal(previous_hidden) + self.h_to_memory_proposal(proposed_hidden))
+
+#         memory_write = write_gate*memory_proposal
+
+#         c= retained_memory + memory_write
+
+#         hidden_update = torch.sigmoid(self.x_to_hidden(previous_hidden) + self.h_to_hidden(proposed_hidden))
+
+#         exposed_memory = torch.tanh(c)
+
+#         x = proposed_hidden + hidden_update*exposed_memory
+
+
+
+#         return x, c
+
+
+
+
+
+
 class Block(nn.Module):
 
     def __init__(self, config, lm_cache):
         super().__init__()
+        self.config = config
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config, lm_cache)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        self.memory_gate_norm = nn.LayerNorm(config.n_embd)
 
-    def forward(self, x, pos_emb_closure, cache_context, start_index):
-        x = x + self.attn(self.ln_1(x), pos_emb_closure, cache_context, start_index)
+        self.forget_gate_mode = config.lstm_forget_gate
+        self.control_input = config.lstm_control_input
+
+        if self.forget_gate_mode not in ("learned", "none"):
+            raise ValueError(
+                f"Unsupported lstm_forget_gate: {self.forget_gate_mode}"
+            )
+        if self.control_input not in (
+            "previous_and_proposed",
+            "proposed",
+        ):
+            raise ValueError(
+                f"Unsupported lstm_control_input: {self.control_input}"
+            )
+
+        use_previous_hidden = (
+            self.control_input == "previous_and_proposed"
+        )
+
+        def previous_projection():
+            if not use_previous_hidden:
+                return None
+            return nn.Linear(
+                config.n_embd,
+                config.n_embd,
+                bias=config.bias,
+            )
+
+        def proposed_projection():
+            return nn.Linear(
+                config.n_embd,
+                config.n_embd,
+                bias=config.bias,
+            )
+
+        if self.forget_gate_mode == "learned":
+            self.previous_to_forget = previous_projection()
+            self.proposed_to_forget = proposed_projection()
+        else:
+            self.previous_to_forget = None
+            self.proposed_to_forget = None
+
+        self.previous_to_write = previous_projection()
+        self.proposed_to_write = proposed_projection()
+
+        self.previous_to_memory_proposal = previous_projection()
+        self.proposed_to_memory_proposal = proposed_projection()
+
+        self.previous_to_hidden = previous_projection()
+        self.proposed_to_hidden = proposed_projection()
+
+    @staticmethod
+    def _control_projection(
+        previous_hidden,
+        proposed_hidden,
+        previous_projection,
+        proposed_projection,
+    ):
+        value = proposed_projection(proposed_hidden)
+        if previous_projection is not None:
+            value = value + previous_projection(previous_hidden)
+        return value
+
+    def forward(
+        self,
+        x,
+        cell,
+        pos_emb_closure,
+        cache_context,
+        start_index,
+        indices=None,
+    ):
+        del indices
+
+        previous_hidden = self.memory_gate_norm(x)
+
+        x = x + self.attn(
+            self.ln_1(x),
+            pos_emb_closure,
+            cache_context,
+            start_index,
+        )
         x = x + self.mlp(self.ln_2(x))
-        return x
-    
+
+        proposed_hidden = self.memory_gate_norm(x)
+
+        if self.forget_gate_mode == "learned":
+            forget_gate = torch.sigmoid(
+                self._control_projection(
+                    previous_hidden,
+                    proposed_hidden,
+                    self.previous_to_forget,
+                    self.proposed_to_forget,
+                )
+            )
+            retained_memory = forget_gate * cell
+        else:
+            # No forget gate means exact additive retention.
+            retained_memory = cell
+
+        write_gate = torch.sigmoid(
+            self._control_projection(
+                previous_hidden,
+                proposed_hidden,
+                self.previous_to_write,
+                self.proposed_to_write,
+            )
+        )
+
+        memory_proposal = torch.tanh(
+            self._control_projection(
+                previous_hidden,
+                proposed_hidden,
+                self.previous_to_memory_proposal,
+                self.proposed_to_memory_proposal,
+            )
+        )
+
+        cell = retained_memory + write_gate * memory_proposal
+
+        hidden_gate = torch.sigmoid(
+            self._control_projection(
+                previous_hidden,
+                proposed_hidden,
+                self.previous_to_hidden,
+                self.proposed_to_hidden,
+            )
+        )
+
+        x = x + hidden_gate * torch.tanh(cell)  # should x be replaced by proposed hidden? # TODO
+        return x, cell
+
 
 class GPTBase(nn.Module):
 
@@ -177,14 +388,25 @@ class GPTBase(nn.Module):
         assert config.sequence_length is not None
         self.config = config
         self.tokenizer = tiktoken.get_encoding("gpt2")
+        self.n_repeat = config.n_repeat
 
+
+        
         self.lm_cache = caches.get_cache(config.lm_cache)(config)
-
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = positional_encoders.get_encoder(config.positional_encoder)(config),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config, self.lm_cache) for _ in range(config.n_layer)]),
+            h_begin = nn.ModuleList( 
+                [Block(config, self.lm_cache) for _ in range(config.n_layer_begin)]
+            ),
+            h_mid = nn.ModuleList(
+                [Block(config, self.lm_cache) 
+                for _ in range(config.n_layer_begin, config.n_layer - config.n_layer_end)],
+            ),
+            h_end = nn.ModuleList( 
+                [Block(config, self.lm_cache) 
+                for _ in range(config.n_layer - config.n_layer_end, config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
 
@@ -202,11 +424,6 @@ class GPTBase(nn.Module):
             if pn.endswith('c_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
-        def _post_init_fn(module):
-            if hasattr(module, "post_init"):
-                module.post_init()
-        self.apply(_post_init_fn)
-        
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -230,6 +447,19 @@ class GPTBase(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def _predict_depth(self, x):
+        T = x.shape[1]
+        if self.config.depth_random_method == "uniform":
+            token_depths = torch.randint(self.config.min_repeat, self.n_repeat+1, size=(T, ), device=x.device)
+        elif self.config.depth_random_method == "uniform_random_range":
+            min_r, max_r = torch.randint(self.config.min_repeat, self.n_repeat + 1, size=(2, )).tolist()
+            if min_r > max_r:
+                min_r, max_r = max_r, min_r
+            token_depths = torch.randint(min_r, max_r + 1, size=(T, ), device=x.device)
+        else:
+            raise NotImplementedError
+        return token_depths
+
     def forward(
         self,
         idx,
@@ -238,10 +468,15 @@ class GPTBase(nn.Module):
         use_cache=False,
         iter=None,
         return_all_logits=False,
+        num_repeats=None,
+        return_repeat_states=False,
     ):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
+        repeats = self.n_repeat if num_repeats is None else int(num_repeats)
+        if repeats <= 0:
+            raise ValueError("num_repeats must be positive.")
         
         
         # forward the GPT model itself
@@ -254,11 +489,59 @@ class GPTBase(nn.Module):
             idx, pos_emb_closure = self.transformer.wpe(idx, iter=iter) # position embeddings of shape (1, t, n_embd)
         else:
             idx, pos_emb_closure = self.transformer.wpe(idx) # position embeddings of shape (1, t, n_embd)
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        x = pos_emb_closure.adapt_model_input(tok_emb, start_index=index_shift)
+        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         x = self.transformer.drop(x)
-        for block in self.transformer.h:
-            x = block(x, pos_emb_closure, cache_context, start_index=index_shift)
+        x = pos_emb_closure.adapt_model_input(x, start_index=index_shift) # does nothign with rope index shift is for autoregressive generation which we don't intend to use we dont have lm cacahe anywyay its annoying
+
+        def run_blocks(hidden, cell, blocks):
+            for block in blocks:
+                hidden, cell = block(
+                    hidden,
+                    cell,
+                    pos_emb_closure,
+                    cache_context,
+                    start_index=index_shift,
+                )
+            return hidden, cell
+
+
+
+        cell = torch.zeros_like(x)
+
+        x, cell = run_blocks(
+            x,
+            cell,
+            self.transformer.h_begin,
+        )
+        # for block in self.transformer.h_begin:
+        #     x = block(x, pos_emb_closure, cache_context, start_index=index_shift)
+        
+
+        # Evaluation-only repeat diagnostics use these snapshots to determine
+        # whether the shared middle stack converges, cycles, or leaves the
+        # representation manifold. The first entry is the post-begin state.
+        repeat_states = [x] if return_repeat_states else None
+        
+        B, T, D = x.shape
+        # fix_x = torch.zeros_like(x)
+        # continue_prob = x.new_ones((B, T))
+        for rep_idx in range(1, repeats + 1):
+            # for block in self.transformer.h_mid:
+            #     x = block(x, pos_emb_closure, cache_context, start_index=index_shift)
+            x, cell = run_blocks(
+                        x,
+                        cell,
+                        self.transformer.h_mid,
+                    )
+            if return_repeat_states:
+                repeat_states.append(x)
+            
+            
+        x, cell = run_blocks(
+                x,
+                cell,
+                self.transformer.h_end,
+            )   
         x = self.transformer.ln_f(x)
 
         if use_cache:
@@ -275,7 +558,19 @@ class GPTBase(nn.Module):
         else:
             loss = None
         logits = logits if get_logits else None
-        return {'logits': logits, 'loss': loss}
+        average_depth = (
+            repeats * len(self.transformer.h_mid)
+            + len(self.transformer.h_begin)
+            + len(self.transformer.h_end)
+        )
+        result = {
+            'logits': logits,
+            'loss': loss,
+            'average_depth': torch.as_tensor(average_depth, device=idx.device),
+        }
+        if return_repeat_states:
+            result['repeat_states'] = repeat_states
+        return result
 
     def clear_state(self):
         self.lm_cache.clear_state()
@@ -294,9 +589,6 @@ class GPTBase(nn.Module):
         # TODO
         pass
 
-    def get_blocklist_weight_modules(self):
-        return (torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding)
-
     def get_parameter_group_specs(self):
         """
         This long function is unfortunately doing something very simple and is being very defensive:
@@ -308,23 +600,21 @@ class GPTBase(nn.Module):
         # separate out all parameters to those that will and won't experience regularizing weight decay
         decay = set()
         no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear,)
-        # need to do import here to avoid circular import (since llama imports from base here)
-        blacklist_weight_modules = self.get_blocklist_weight_modules()
-
+        whitelist_weight_modules = (torch.nn.Linear, )
+        blacklist_weight_modules = (torch.nn.LayerNorm, LayerNorm, torch.nn.Embedding)
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
-                fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
+                fpn = '%s.%s' % (mn, pn) if mn else pn # full param name
                 # random note: because named_modules and named_parameters are recursive
                 # we will see the same tensors p many many times. but doing it this way
                 # allows us to know which parent module any tensor p belongs to...
-                if pn.endswith("bias"):
+                if pn.endswith('bias'):
                     # all biases will not be decayed
                     no_decay.add(fpn)
-                elif pn.endswith("weight") and isinstance(m, whitelist_weight_modules):
+                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
                     # weights of whitelist modules will be weight decayed
                     decay.add(fpn)
-                elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
+                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
                     # weights of blacklist modules will NOT be weight decayed
                     no_decay.add(fpn)
 
@@ -334,27 +624,21 @@ class GPTBase(nn.Module):
         # will only return the first occurence, key'd by 'transformer.wte.weight', below.
         # so let's manually remove 'lm_head.weight' from decay set. This will include
         # this tensor into optimization via transformer.wte.weight only, and not decayed.
-        decay.remove("lm_head.weight")
+        decay.remove('lm_head.weight')
 
         # validate that we considered every parameter
         param_dict = {pn: p for pn, p in self.named_parameters()}
         inter_params = decay & no_decay
         union_params = decay | no_decay
-        assert (
-            len(inter_params) == 0
-        ), "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
-        assert (
-            len(param_dict.keys() - union_params) == 0
-        ), "parameters %s were not separated into either decay/no_decay set!" % (
-            str(param_dict.keys() - union_params),
-        )
+        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
+        assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
+                                                    % (str(param_dict.keys() - union_params), )
 
         # create the pytorch optimizer object
         return [
             {"params": sorted(list(decay))},
             {"params": sorted(list(no_decay)), "weight_decay": 0.0},
         ]
-
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):

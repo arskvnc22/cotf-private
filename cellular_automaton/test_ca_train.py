@@ -7,6 +7,7 @@ from cellular_automaton.ca_train import (
     ca_selection_key,
     extrapolation_checkpoint_eligible,
     extrapolation_checkpoint_updates,
+    should_run_scheduled_evaluation,
     training_pair_for_step,
     _supports_clean_state_intervention,
 )
@@ -153,6 +154,19 @@ def test_variable_training_pairs_are_round_robin_and_resume_stable():
         (1, 1),
     ]
     assert training_pair_for_step([], 10) is None
+
+
+def test_scheduled_evaluation_skips_step_zero_and_keeps_positive_intervals():
+    assert not should_run_scheduled_evaluation(0, 1_000)
+    assert not should_run_scheduled_evaluation(999, 1_000)
+    assert should_run_scheduled_evaluation(1_000, 1_000)
+    assert should_run_scheduled_evaluation(2_000, 1_000)
+
+
+@pytest.mark.parametrize("step,eval_freq", [(-1, 1_000), (0, 0)])
+def test_scheduled_evaluation_rejects_invalid_inputs(step, eval_freq):
+    with pytest.raises(ValueError):
+        should_run_scheduled_evaluation(step, eval_freq)
 
 
 def test_fresh_run_records_its_requested_forward_policy():

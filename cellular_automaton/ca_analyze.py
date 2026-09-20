@@ -28,6 +28,12 @@ Compare delayed-recall runs using two selected metrics::
                  run_142__dca_but_h6_intermediate_subtract \
         --metrics cell_accuracy exact_sequence_accuracy
 
+Compare one-pass and two-pass recall training at one horizon::
+
+    python -m cellular_automaton.ca_analyze recall-repeat-compare \
+        --runs iridis/dca-30/runs \
+        --where model=dca_cotf_cache --horizon 30
+
 Rank delayed-recall runs (the first metric determines rank)::
 
     python -m cellular_automaton.ca_analyze delayed-leaderboard \
@@ -90,6 +96,8 @@ FIELD_ALIASES = {
     "test_seed": "seeds.ca_test_seed",
     "optimizer": "training.opt",
     "lr": "training.lr",
+    "forget_gate": "model.lstm_forget_gate",
+    "control_input": "model.lstm_control_input",
     "weight_decay": "training.weight_decay",
     "grad_clip": "training.grad_clip",
     "training_pairs": "training.pairs",
@@ -193,6 +201,24 @@ DELAYED_METRICS = {
         "delayed_recall_internal_decoded_requested",
         "cell_accuracy",
     ),
+    "changed_cell_accuracy": DelayedMetricSpec(
+        "changed cell",
+        "delayed_recall_nontrivial_pair_macro",
+        "cell_accuracy",
+        "delayed_recall_nontrivial_queries_macro",
+        "cell_accuracy",
+        "delayed_recall_ground_truth_requested",
+        "cell_accuracy",
+    ),
+    "internal_changed_cell_accuracy": DelayedMetricSpec(
+        "internal changed cell",
+        "delayed_recall_nontrivial_internal_pair_macro",
+        "decoded_requested_repeat_cell_accuracy",
+        "delayed_recall_nontrivial_internal_macro",
+        "decoded_requested_repeat_cell_accuracy",
+        "delayed_recall_internal_decoded_requested",
+        "cell_accuracy",
+    ),
     "internal_exact_sequence_accuracy": DelayedMetricSpec(
         "internal exact",
         "delayed_recall_nontrivial_internal_pair_macro",
@@ -274,6 +300,17 @@ DELAYED_CANDIDATE_METRICS = frozenset(
         "normalized_mse",
     }
 )
+
+DELAYED_CHANGED_CELL_SUPPORT = {
+    "changed_cell_accuracy": (
+        "delayed_recall_ground_truth_candidate",
+        "delayed_recall_ground_truth_collision",
+    ),
+    "internal_changed_cell_accuracy": (
+        "delayed_recall_internal_decoded_candidate",
+        "delayed_recall_internal_decoded_collision",
+    ),
+}
 
 DELAYED_PROTOCOL_FIELDS = (
     "dataset",
@@ -527,6 +564,20 @@ def configuration_id(configuration: Mapping[str, Any]) -> str:
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()[:10]
 
+def lstm_ut_configuration_fields(
+    manifest: Mapping[str, Any],
+) -> tuple[Any, Any]:
+    """Return LSTM-UT ablation fields, or null fields for other models."""
+
+    model = str(dotted_get(manifest, "model", ""))
+    if "lstm_ut" not in model.lower():
+        return None, None
+
+    return (
+        dotted_get(manifest, "model.lstm_forget_gate", "?"),
+        dotted_get(manifest, "model.lstm_control_input", "?"),
+    )
+
 
 def configuration_label(manifest: Mapping[str, Any]) -> str:
     model = dotted_get(manifest, "model", "?")
@@ -537,11 +588,19 @@ def configuration_label(manifest: Mapping[str, Any]) -> str:
     weight_decay = dotted_get(manifest, "weight_decay", "?")
     grad_clip = dotted_get(manifest, "grad_clip", "?")
     cache_policy = forward_policy_signature(manifest)
+    forget_gate, control_input = lstm_ut_configuration_fields(manifest)
+
+    lstm_configuration = ""
+    if forget_gate is not None:
+        lstm_configuration = (
+            f" lstm-forget={forget_gate} lstm-control={control_input}"
+        )
+
     return (
-        f"{model} {architecture} {cache_policy} pairs={pairs} opt={optimizer} lr={lr} "
+        f"{model} {architecture}{lstm_configuration} {cache_policy} "
+        f"pairs={pairs} opt={optimizer} lr={lr} "
         f"wd={weight_decay} clip={grad_clip}"
     )
-
 
 def forward_policy_signature(manifest: Mapping[str, Any]) -> str:
     """Return a concise training-time cache-policy label for configurations."""
@@ -1115,11 +1174,16 @@ def command_table(args: argparse.Namespace, runs: Sequence[Run]) -> int:
             for pair in representative.manifest["training"]["pairs"]
         }
         training_policy = forward_policy_metadata(representative.manifest)
+        forget_gate, control_input = lstm_ut_configuration_fields(
+            representative.manifest
+        )
         values = []
         export = {
             "configuration_id": group_id,
             "configuration": configuration_label(representative.manifest),
             "architecture": architecture_signature(representative.manifest),
+            "lstm_forget_gate": forget_gate,
+            "lstm_control_input": control_input,
             "training_cache_policy": training_policy["repeat_cache_policy"],
             "training_cache_window": training_policy["repeat_cache_window"],
             "run_ids": contributing_run_ids,
@@ -1307,11 +1371,14 @@ def command_leaderboard(args: argparse.Namespace, runs: Sequence[Run]) -> int:
         pair_values = values_by_step.get(selected_step, {})
         manifest = run.manifest
         training_policy = forward_policy_metadata(manifest)
+        forget_gate, control_input = lstm_ut_configuration_fields(manifest)
         rows.append(
             {
                 "run_id": run.run_id,
                 "status": manifest.get("status"),
                 "model": dotted_get(manifest, "model"),
+                "lstm_forget_gate": forget_gate,
+                "lstm_control_input": control_input,
                 "model_seed": dotted_get(manifest, "seed"),
                 "data_seed": dotted_get(manifest, "data_seed"),
                 "architecture": architecture_signature(manifest),
@@ -1385,6 +1452,8 @@ def command_leaderboard(args: argparse.Namespace, runs: Sequence[Run]) -> int:
                 rank,
                 row["run_id"],
                 row["model"],
+                row["lstm_forget_gate"] or "—",
+                row["lstm_control_input"] or "—",
                 protocol_id,
                 row["model_seed"],
                 row["data_seed"],
@@ -1412,6 +1481,8 @@ def command_leaderboard(args: argparse.Namespace, runs: Sequence[Run]) -> int:
                 "rank",
                 "run",
                 "model",
+                "forget gate",
+                "control input",
                 "protocol",
                 "seed",
                 "data",
@@ -1553,6 +1624,140 @@ def _put_latest(
         }
 
 
+def _changed_cell_accuracy(
+    requested_accuracy: float,
+    current_accuracy: float,
+    requested_current_agreement: float,
+) -> float | None:
+    """Recover accuracy where requested and current binary cells differ.
+
+    On a changed cell, a prediction that matches the requested bit cannot
+    match the current bit, and vice versa.  This lets the masked accuracy be
+    recovered exactly from the three aggregate pairwise agreements already
+    present in delayed-recall reports.
+    """
+
+    changed_fraction = 1.0 - requested_current_agreement
+    if changed_fraction <= 0.0:
+        return None
+    accuracy = (
+        requested_accuracy - current_accuracy + changed_fraction
+    ) / (2.0 * changed_fraction)
+    # The inputs are ratios accumulated over the same cells.  Clamp only the
+    # tiny floating-point spill that can occur at the endpoints.
+    if accuracy < -1e-9 or accuracy > 1.0 + 1e-9:
+        raise ValueError(
+            "Inconsistent delayed-recall candidate metrics produced an "
+            f"invalid changed-cell accuracy: {accuracy}."
+        )
+    return min(1.0, max(0.0, accuracy))
+
+
+def _derive_delayed_changed_cell_metrics(
+    result: dict[str, Any],
+    specs: Mapping[str, DelayedMetricSpec],
+) -> None:
+    """Populate explicitly requested changed-cell recall diagnostics."""
+
+    for metric, (candidate_role, collision_role) in (
+        DELAYED_CHANGED_CELL_SUPPORT.items()
+    ):
+        if metric not in specs:
+            continue
+
+        derived_queries = {}
+        for key, requested in tuple(result["queries"].items()):
+            horizon, query_repeat, selected_metric = key
+            if selected_metric != metric:
+                continue
+            del result["queries"][key]
+            if query_repeat == horizon:
+                continue
+
+            current = result["candidates"].get(
+                (
+                    horizon,
+                    query_repeat,
+                    horizon,
+                    candidate_role,
+                    "cell_accuracy",
+                )
+            )
+            agreement = result["candidates"].get(
+                (
+                    horizon,
+                    query_repeat,
+                    horizon,
+                    collision_role,
+                    "cell_agreement",
+                )
+            )
+            if current is None or agreement is None:
+                continue
+            steps = {
+                measurement["step"]
+                for measurement in (requested, current, agreement)
+            }
+            if len(steps) != 1:
+                continue
+            value = _changed_cell_accuracy(
+                requested["value"],
+                current["value"],
+                agreement["value"],
+            )
+            if value is not None:
+                derived_queries[key] = {
+                    "step": requested["step"],
+                    "value": value,
+                }
+        result["queries"].update(derived_queries)
+
+        result["overall"].pop(metric, None)
+        for key in tuple(result["horizons"]):
+            if key[1] == metric:
+                del result["horizons"][key]
+
+        by_horizon: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for (horizon, _query_repeat, selected_metric), measurement in (
+            derived_queries.items()
+        ):
+            if selected_metric == metric:
+                by_horizon[horizon].append(measurement)
+
+        for horizon, measurements in by_horizon.items():
+            steps = {
+                measurement["step"]
+                for measurement in measurements
+                if measurement["step"] is not None
+            }
+            result["horizons"][(horizon, metric)] = {
+                "step": max(steps) if steps else None,
+                "value": sum(item["value"] for item in measurements)
+                / len(measurements),
+            }
+
+        horizon_measurements = [
+            measurement
+            for (horizon, selected_metric), measurement in result[
+                "horizons"
+            ].items()
+            if selected_metric == metric
+        ]
+        if horizon_measurements:
+            steps = {
+                measurement["step"]
+                for measurement in horizon_measurements
+                if measurement["step"] is not None
+            }
+            result["overall"][metric] = {
+                "step": max(steps) if steps else None,
+                "value": sum(
+                    item["value"] for item in horizon_measurements
+                )
+                / len(horizon_measurements),
+            }
+
+
 def collect_delayed_run(
     run: Run,
     args: argparse.Namespace,
@@ -1568,18 +1773,15 @@ def collect_delayed_run(
         "validation": {},
         "candidates": {},
     }
-    overall_lookup = {
-        (spec.overall_role, spec.overall_metric): name
-        for name, spec in specs.items()
-    }
-    horizon_lookup = {
-        (spec.horizon_role, spec.horizon_metric): name
-        for name, spec in specs.items()
-    }
-    query_lookup = {
-        (spec.query_role, spec.query_metric): (name, spec)
-        for name, spec in specs.items()
-    }
+    overall_lookup: dict[tuple[str, str], list[str]] = defaultdict(list)
+    horizon_lookup: dict[tuple[str, str], list[str]] = defaultdict(list)
+    query_lookup: dict[
+        tuple[str, str], list[tuple[str, DelayedMetricSpec]]
+    ] = defaultdict(list)
+    for name, spec in specs.items():
+        overall_lookup[(spec.overall_role, spec.overall_metric)].append(name)
+        horizon_lookup[(spec.horizon_role, spec.horizon_metric)].append(name)
+        query_lookup[(spec.query_role, spec.query_metric)].append((name, spec))
     id_lookup = {
         spec.id_metric: name
         for name, spec in specs.items()
@@ -1594,49 +1796,55 @@ def collect_delayed_run(
         split = record.get("data_split")
 
         if split == "validation" and record.get("checkpoint_type") is None:
-            selected = overall_lookup.get((role, metric))
-            if selected is not None and record.get("step") is not None:
-                result["validation"].setdefault(int(record["step"]), {})[
-                    selected
-                ] = float(record["value"])
+            selected_metrics = overall_lookup.get((role, metric), ())
+            if selected_metrics and record.get("step") is not None:
+                validation = result["validation"].setdefault(
+                    int(record["step"]), {}
+                )
+                for selected in selected_metrics:
+                    validation[selected] = float(record["value"])
 
         if split != args.split or not _checkpoint_matches(
             record, args.checkpoint
         ):
             continue
 
-        selected = overall_lookup.get((role, metric))
-        if selected is not None:
-            _put_latest(result["overall"], selected, record)
+        selected_metrics = overall_lookup.get((role, metric), ())
+        if selected_metrics:
+            for selected in selected_metrics:
+                _put_latest(result["overall"], selected, record)
             continue
 
-        selected = horizon_lookup.get((role, metric))
-        if selected is not None:
+        selected_metrics = horizon_lookup.get((role, metric), ())
+        if selected_metrics:
             horizon = record.get("num_repeats")
             if horizon is not None:
-                _put_latest(
-                    result["horizons"], (int(horizon), selected), record
-                )
+                for selected in selected_metrics:
+                    _put_latest(
+                        result["horizons"],
+                        (int(horizon), selected),
+                        record,
+                    )
             continue
 
-        query_match = query_lookup.get((role, metric))
-        if query_match is not None:
-            selected, spec = query_match
+        query_matches = query_lookup.get((role, metric), ())
+        if query_matches:
             horizon = record.get("num_repeats")
             query_repeat = record.get("repeat_from")
             candidate = record.get("repeat_to")
             if horizon is None or query_repeat is None:
                 continue
-            if (
-                spec.query_requires_requested_candidate
-                and candidate != query_repeat
-            ):
-                continue
-            _put_latest(
-                result["queries"],
-                (int(horizon), int(query_repeat), selected),
-                record,
-            )
+            for selected, spec in query_matches:
+                if (
+                    spec.query_requires_requested_candidate
+                    and candidate != query_repeat
+                ):
+                    continue
+                _put_latest(
+                    result["queries"],
+                    (int(horizon), int(query_repeat), selected),
+                    record,
+                )
             # The requested-candidate cosine record is also useful in the
             # complete candidate export, so it is intentionally not skipped.
 
@@ -1667,6 +1875,7 @@ def collect_delayed_run(
                     ),
                     record,
                 )
+    _derive_delayed_changed_cell_metrics(result, specs)
     return result
 
 
@@ -1680,10 +1889,13 @@ def _delayed_configuration_metadata(
     protocol = delayed_protocol_configuration(manifest)
     protocol_key = json.dumps(protocol, sort_keys=True, default=str)
     policy = forward_policy_metadata(manifest)
+    forget_gate, control_input = lstm_ut_configuration_fields(manifest)
     return {
         "configuration_id": configuration_id_value,
         "configuration": configuration_label(manifest),
         "model": dotted_get(manifest, "model"),
+        "lstm_forget_gate": forget_gate,
+        "lstm_control_input": control_input,
         "controller_application": manifest.get("model", {}).get(
             "ca_controller_application"
         ),
@@ -1999,6 +2211,8 @@ def _print_delayed_comparison(
             (
                 config["configuration_id"],
                 config["model"],
+                config["lstm_forget_gate"] or "—",
+                config["lstm_control_input"] or "—",
                 config["controller_application"],
                 config["architecture"],
                 config["training_cache_policy"],
@@ -2014,6 +2228,8 @@ def _print_delayed_comparison(
             (
                 "config id",
                 "model",
+                "forget gate",
+                "control input",
                 "controller",
                 "architecture",
                 "cache",
@@ -2134,6 +2350,409 @@ def command_delayed_compare(
     return 0
 
 
+RECALL_REPEAT_COUNTS = (1, 2)
+RECALL_REPEAT_METRICS = ("cell_accuracy", "internal_cell_accuracy")
+
+
+def _training_recall_repeats(manifest: Mapping[str, Any]) -> int:
+    """Return the explicitly recorded delayed-query training recall depth."""
+
+    resolved = manifest.get("resolved_args", {})
+    value = (
+        resolved.get("ca_recall_repeats")
+        if isinstance(resolved, Mapping)
+        else None
+    )
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(
+            "Recall-repeat comparison requires every selected run manifest "
+            "to record a positive integer resolved_args.ca_recall_repeats."
+        )
+    return value
+
+
+def _recall_repeat_family_configuration(
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the controlled configuration with recall depth as intervention."""
+
+    configuration = _delayed_comparison_configuration(
+        manifest, average_over=("seed", "data_seed")
+    )
+    resolved = dict(configuration["resolved_args"])
+    resolved.pop("ca_recall_repeats", None)
+    return {**configuration, "resolved_args": resolved}
+
+
+def _paired_recall_runs(
+    runs: Sequence[Run], requested_run_ids: Sequence[str] | None
+) -> tuple[list[Run], dict[int, dict[tuple[Any, Any], Run]], str]:
+    selected = _select_delayed_runs(runs, requested_run_ids)
+    if not selected:
+        raise ValueError("No run manifests matched the recall-repeat comparison.")
+
+    eligible = []
+    for run in selected:
+        recall_repeats = _training_recall_repeats(run.manifest)
+        if recall_repeats in RECALL_REPEAT_COUNTS:
+            eligible.append((run, recall_repeats))
+    if not eligible:
+        raise ValueError(
+            "No selected runs use ca_recall_repeats=1 or ca_recall_repeats=2."
+        )
+
+    families: dict[str, list[tuple[Run, int]]] = defaultdict(list)
+    for run, recall_repeats in eligible:
+        family = _recall_repeat_family_configuration(run.manifest)
+        families[configuration_id(family)].append((run, recall_repeats))
+    if len(families) != 1:
+        details = ", ".join(
+            f"{family_id} ({len(members)} runs)"
+            for family_id, members in sorted(families.items())
+        )
+        raise ValueError(
+            "Recall-repeat comparison requires exactly one scientific "
+            "configuration after removing seeds and ca_recall_repeats; "
+            f"found {len(families)}: {details}. Narrow --run-id or --where."
+        )
+
+    family_id, family_members = next(iter(families.items()))
+    by_depth: dict[int, dict[tuple[Any, Any], Run]] = {
+        depth: {} for depth in RECALL_REPEAT_COUNTS
+    }
+    for run, recall_repeats in family_members:
+        seed_key = (
+            dotted_get(run.manifest, "seed"),
+            dotted_get(run.manifest, "data_seed"),
+        )
+        if None in seed_key:
+            raise ValueError(
+                f"Run {run.run_id} lacks a model seed or data seed and cannot "
+                "participate in a paired comparison."
+            )
+        previous = by_depth[recall_repeats].get(seed_key)
+        if previous is not None:
+            raise ValueError(
+                "Recall-repeat comparison found duplicate runs for "
+                f"ca_recall_repeats={recall_repeats}, seed={seed_key[0]}, "
+                f"data_seed={seed_key[1]}: {previous.run_id}, {run.run_id}."
+            )
+        by_depth[recall_repeats][seed_key] = run
+
+    missing_depths = [
+        depth for depth in RECALL_REPEAT_COUNTS if not by_depth[depth]
+    ]
+    if missing_depths:
+        raise ValueError(
+            "Recall-repeat comparison requires both ca_recall_repeats=1 and "
+            "ca_recall_repeats=2; missing "
+            + ", ".join(map(str, missing_depths))
+            + "."
+        )
+    one_seeds = set(by_depth[1])
+    two_seeds = set(by_depth[2])
+    if one_seeds != two_seeds:
+        only_one = sorted(one_seeds - two_seeds, key=str)
+        only_two = sorted(two_seeds - one_seeds, key=str)
+        raise ValueError(
+            "Recall-repeat comparison requires identical paired (model_seed, "
+            "data_seed) coverage. Only one-pass: "
+            f"{only_one or 'none'}; only two-pass: {only_two or 'none'}."
+        )
+    for seed_key in one_seeds:
+        one_shuffle_seed = dotted_get(
+            by_depth[1][seed_key].manifest, "resolved_args.ca_shuffle_seed"
+        )
+        two_shuffle_seed = dotted_get(
+            by_depth[2][seed_key].manifest, "resolved_args.ca_shuffle_seed"
+        )
+        if one_shuffle_seed != two_shuffle_seed:
+            raise ValueError(
+                "Paired recall-repeat runs must use the same CA shuffle seed; "
+                f"seed={seed_key[0]}, data_seed={seed_key[1]} has "
+                f"one-pass={one_shuffle_seed} and two-pass={two_shuffle_seed}."
+            )
+    paired_runs = [
+        by_depth[depth][seed_key]
+        for seed_key in sorted(one_seeds, key=str)
+        for depth in RECALL_REPEAT_COUNTS
+    ]
+    return paired_runs, by_depth, family_id
+
+
+def _recall_repeat_measurement(
+    run_data: Mapping[str, Mapping[str, Any]],
+    run: Run,
+    *,
+    horizon: int,
+    query_repeat: int | None,
+    metric: str,
+) -> Mapping[str, Any]:
+    if query_repeat is None:
+        measurement = run_data[run.run_id]["horizons"].get((horizon, metric))
+        description = f"horizon {horizon} nontrivial overall {metric}"
+    else:
+        measurement = run_data[run.run_id]["queries"].get(
+            (horizon, query_repeat, metric)
+        )
+        description = (
+            f"horizon {horizon}, query repeat {query_repeat}, {metric}"
+        )
+    if measurement is None:
+        raise ValueError(
+            f"Run {run.run_id} has no matching {description} record. The "
+            "comparison requires complete ground-truth and internal recall "
+            "coverage for every requested age."
+        )
+    return measurement
+
+
+def _recall_repeat_row(
+    run_data: Mapping[str, Mapping[str, Any]],
+    by_depth: Mapping[int, Mapping[tuple[Any, Any], Run]],
+    *,
+    horizon: int,
+    recall_age: int | None,
+) -> dict[str, Any]:
+    query_repeat = None if recall_age is None else horizon - recall_age
+    seed_keys = sorted(by_depth[1], key=str)
+    row: dict[str, Any] = {
+        "scope": "overall_nontrivial" if recall_age is None else "recall_age",
+        "horizon": horizon,
+        "recall_age": recall_age,
+        "query_repeat": query_repeat,
+        "is_no_op": recall_age == 0 if recall_age is not None else False,
+        "paired_seed_count": len(seed_keys),
+    }
+    paired_values: list[dict[str, Any]] = []
+    for metric in RECALL_REPEAT_METRICS:
+        one_values = []
+        two_values = []
+        deltas = []
+        for seed_key in seed_keys:
+            one_run = by_depth[1][seed_key]
+            two_run = by_depth[2][seed_key]
+            one = _recall_repeat_measurement(
+                run_data,
+                one_run,
+                horizon=horizon,
+                query_repeat=query_repeat,
+                metric=metric,
+            )
+            two = _recall_repeat_measurement(
+                run_data,
+                two_run,
+                horizon=horizon,
+                query_repeat=query_repeat,
+                metric=metric,
+            )
+            one_value = float(one["value"])
+            two_value = float(two["value"])
+            one_values.append(one_value)
+            two_values.append(two_value)
+            deltas.append(two_value - one_value)
+            paired_values.append(
+                {
+                    "metric": metric,
+                    "model_seed": seed_key[0],
+                    "data_seed": seed_key[1],
+                    "one_repeat_run_id": one_run.run_id,
+                    "two_repeat_run_id": two_run.run_id,
+                    "one_repeat_checkpoint_step": one["step"],
+                    "two_repeat_checkpoint_step": two["step"],
+                    "one_repeat_value": one_value,
+                    "two_repeat_value": two_value,
+                    "delta_two_minus_one": two_value - one_value,
+                }
+            )
+        prefix = "ground_truth" if metric == "cell_accuracy" else "internal"
+        for name, values in (
+            ("one_repeat", one_values),
+            ("two_repeat", two_values),
+            ("delta_two_minus_one", deltas),
+        ):
+            summary = summarize(values)
+            for statistic in ("mean", "std", "min", "max"):
+                row[f"{prefix}_{name}_{statistic}"] = summary[statistic]
+    row["paired_values"] = paired_values
+    return row
+
+
+def build_recall_repeat_report(
+    args: argparse.Namespace, runs: Sequence[Run]
+) -> tuple[list[Run], dict[str, Any]]:
+    if args.horizon < 2:
+        raise ValueError(
+            "--horizon must be at least 2 so the nontrivial overall recall "
+            "summary contains at least one positive recall age."
+        )
+    if args.length <= 0:
+        raise ValueError("--length must be positive.")
+    selected_runs, by_depth, family_id = _paired_recall_runs(runs, args.run_id)
+    model_names = {
+        dotted_get(run.manifest, "resolved_args.model")
+        for run in selected_runs
+    }
+    if None in model_names or len(model_names) != 1:
+        raise ValueError(
+            "Recall-repeat comparison requires exactly one model; found "
+            f"{sorted(map(str, model_names))}."
+        )
+    model_name = next(iter(model_names))
+    specs = {name: DELAYED_METRICS[name] for name in RECALL_REPEAT_METRICS}
+    run_data = {
+        run.run_id: collect_delayed_run(run, args, specs)
+        for run in selected_runs
+    }
+    rows = [
+        _recall_repeat_row(
+            run_data, by_depth, horizon=args.horizon, recall_age=recall_age
+        )
+        for recall_age in range(args.horizon)
+    ]
+    rows.append(
+        _recall_repeat_row(
+            run_data, by_depth, horizon=args.horizon, recall_age=None
+        )
+    )
+    seed_keys = sorted(by_depth[1], key=str)
+    one_checkpoint_steps = sorted(
+        {
+            paired["one_repeat_checkpoint_step"]
+            for row in rows
+            for paired in row["paired_values"]
+            if paired["one_repeat_checkpoint_step"] is not None
+        }
+    )
+    two_checkpoint_steps = sorted(
+        {
+            paired["two_repeat_checkpoint_step"]
+            for row in rows
+            for paired in row["paired_values"]
+            if paired["two_repeat_checkpoint_step"] is not None
+        }
+    )
+    return selected_runs, {
+        "model" : model_name,
+        "horizon": args.horizon,
+        "length": args.length,
+        "data_split": args.split,
+        "checkpoint_type": args.checkpoint,
+        "configuration_family_id": family_id,
+        "recall_repeat_counts": list(RECALL_REPEAT_COUNTS),
+        "metrics": {
+            "ground_truth": "cell_accuracy against the requested CA state",
+            "internal": (
+                "cell_accuracy against the state decoded at the requested "
+                "evolution repeat"
+            ),
+        },
+        "delta_definition": "two_repeat_value - one_repeat_value",
+        "overall_definition": (
+            "existing horizon-level nontrivial delayed-recall macro; "
+            "recall age zero excluded"
+        ),
+        "paired_seeds": [
+            {"model_seed": key[0], "data_seed": key[1]} for key in seed_keys
+        ],
+        "one_repeat_run_ids": [by_depth[1][key].run_id for key in seed_keys],
+        "two_repeat_run_ids": [by_depth[2][key].run_id for key in seed_keys],
+        "one_repeat_checkpoint_steps": one_checkpoint_steps,
+        "two_repeat_checkpoint_steps": two_checkpoint_steps,
+        "rows": rows,
+    }
+
+
+def _print_recall_repeat_report(report: Mapping[str, Any]) -> None:
+    model_name = report["model"]
+    model_label = {
+        "dca_but": "BUT",
+        "dca_cotf_cache": "CoTFormer",
+    }.get(model_name, model_name)
+
+    rendered = []
+    for row in report["rows"]:
+        label = (
+            "overall*"
+            if row["scope"] == "overall_nontrivial"
+            else str(row["recall_age"])
+        )
+        rendered.append(
+            (
+                label,
+                "—" if row["query_repeat"] is None else row["query_repeat"],
+                f"{row['ground_truth_one_repeat_mean']:.6f}",
+                f"{row['ground_truth_two_repeat_mean']:.6f}",
+                f"{row['ground_truth_delta_two_minus_one_mean']:+.6f}",
+                f"{row['internal_one_repeat_mean']:.6f}",
+                f"{row['internal_two_repeat_mean']:.6f}",
+                f"{row['internal_delta_two_minus_one_mean']:+.6f}",
+                row["paired_seed_count"],
+            )
+        )
+    print(
+        f"Recall-repeat comparison for {model_label} ({model_name}): "
+        f"1 recall pass vs 2 recall passes at horizon {report['horizon']} "
+        f"({report['data_split']}/{report['checkpoint_type']})"
+    )
+    print(
+        "Checkpoint steps: "
+        f"one-pass={report['one_repeat_checkpoint_steps'] or 'unknown'}, "
+        f"two-pass={report['two_repeat_checkpoint_steps'] or 'unknown'}"
+    )
+    print(
+        _terminal_table(
+            (
+                "recall age",
+                "query repeat",
+                "GT 1-pass mean",
+                "GT 2-pass mean",
+                "GT mean delta",
+                "internal 1-pass mean",
+                "internal 2-pass mean",
+                "internal mean delta",
+                "paired seeds",
+            ),
+            rendered,
+        )
+    )
+    print(
+        "\nDeltas are two-pass minus one-pass. Internal recall is agreement "
+        "with the state decoded at the requested evolution repeat, not "
+        "ground-truth accuracy.\n* overall excludes recall age zero."
+    )
+
+
+def command_recall_repeat_compare(
+    args: argparse.Namespace, runs: Sequence[Run]
+) -> int:
+    selected_runs, report = build_recall_repeat_report(args, runs)
+    _print_recall_repeat_report(report)
+    if args.output_dir is not None:
+        report_dir = _report_dir(args)
+        csv_rows = [
+            {key: value for key, value in row.items() if key != "paired_values"}
+            for row in report["rows"]
+        ]
+        paired_rows = [
+            {
+                "scope": row["scope"],
+                "horizon": row["horizon"],
+                "recall_age": row["recall_age"],
+                "query_repeat": row["query_repeat"],
+                **paired,
+            }
+            for row in report["rows"]
+            for paired in row["paired_values"]
+        ]
+        _write_csv(report_dir / "recall_repeat_comparison.csv", csv_rows)
+        _write_csv(report_dir / "recall_repeat_paired_values.csv", paired_rows)
+        write_json(report_dir / "recall_repeat_comparison.json", report)
+        _write_analysis_manifest(report_dir, args, selected_runs)
+        print(f"\nWrote recall-repeat comparison to {report_dir}")
+    return 0
+
+
 def command_delayed_leaderboard(
     args: argparse.Namespace, runs: Sequence[Run]
 ) -> int:
@@ -2169,10 +2788,13 @@ def command_delayed_leaderboard(
     for rank, run in enumerate(ranked_runs, start=1):
         manifest = run.manifest
         measurements = overall_by_run[run.run_id]
+        forget_gate, control_input = lstm_ut_configuration_fields(manifest)
         row = {
             "rank": rank,
             "run_id": run.run_id,
             "model": dotted_get(manifest, "model"),
+            "lstm_forget_gate": forget_gate,
+            "lstm_control_input": control_input,
             "controller_application": manifest.get("model", {}).get(
                 "ca_controller_application"
             ),
@@ -2195,6 +2817,8 @@ def command_delayed_leaderboard(
                 rank,
                 run.run_id,
                 row["model"],
+                row["lstm_forget_gate"] or "—",
+                row["lstm_control_input"] or "—",
                 row["controller_application"],
                 row["architecture"],
                 row["training_cache"],
@@ -2210,6 +2834,8 @@ def command_delayed_leaderboard(
                 "rank",
                 "run",
                 "model",
+                "forget gate",
+                "control input",
                 "controller",
                 "architecture",
                 "cache",
@@ -2298,8 +2924,9 @@ def _plot_seed_curves(
     title: str,
     categorical: bool,
 ):
-    figure, axis = plt.subplots(figsize=(11, 6))
+    figure, axis = plt.subplots(figsize=(12, 6), layout="constrained")
     raw = context["raw"]
+    bounded_accuracy = "accuracy" in ylabel or ylabel.endswith("_rate")
     category_positions = None
     if categorical:
         categories = sorted(
@@ -2319,39 +2946,81 @@ def _plot_seed_curves(
             return ordered
         return [category_positions[value] for value in ordered]
 
-    for (group_id, line, run_id), points in raw.items():
-        ordered = sorted(
-            points,
-            key=_category_sort_key if categorical else lambda value: value,
-        )
-        axis.plot(
-            plotted_x(ordered),
-            [points[x] for x in ordered],
-            alpha=0.16,
-            linewidth=1,
-        )
+    model_names = {
+        group_id: str(dotted_get(members[0].manifest, "model"))
+        for group_id, members in context["groups"].items()
+    }
+    model_labels = {"dca_but": "BUT", "dca_cotf_cache": "CoTFormer"}
+    model_colors = {"dca_but": "#0072B2", "dca_cotf_cache": "#D55E00"}
+    for index, model in enumerate(sorted(set(model_names.values()))):
+        if model not in model_colors:
+            model_colors[model] = plt.get_cmap("tab10")(index % 10)
+    line_styles = ("--", ":", "-.")
+    series_names = {line for _group_id, line in aggregates}
     for (group_id, line), points in aggregates.items():
         ordered = sorted(
             points,
             key=_category_sort_key if categorical else lambda value: value,
         )
-        means = [summarize(points[x])["mean"] for x in ordered]
-        stds = [summarize(points[x])["std"] for x in ordered]
-        representative = context["groups"][group_id][0]
-        label = (
-            f"{configuration_label(representative.manifest)} | {line}"
-        )
+        summaries = [summarize(points[x]) for x in ordered]
+        means = [summary["mean"] for summary in summaries]
+        stds = [summary["std"] for summary in summaries]
+        model = model_names[group_id]
+        color = model_colors[model]
+        label = model_labels.get(model, model)
+        if list(model_names.values()).count(model) > 1:
+            label += f" [{group_id[:6]}]"
+        if len(series_names) > 1:
+            label += f" · {line}"
+        counts = [summary["n"] for summary in summaries]
+        coverage = str(min(counts)) if min(counts) == max(counts) else f"{min(counts)}–{max(counts)}"
         x_coordinates = plotted_x(ordered)
-        axis.plot(x_coordinates, means, marker="o", linewidth=2, label=label)
-        axis.fill_between(
-            x_coordinates,
-            [mean - std for mean, std in zip(means, stds)],
-            [mean + std for mean, std in zip(means, stds)],
-            alpha=0.16,
+        axis.plot(
+            x_coordinates, means, color=color, marker="o", markersize=5,
+            linewidth=2.8, label=f"{label} mean (n={coverage})", zorder=4,
         )
+        lower = [mean - std for mean, std in zip(means, stds)]
+        upper = [mean + std for mean, std in zip(means, stds)]
+        # Only the displayed band is bounded; exported means and sample SDs
+        # retain their original values, including SDs extending past 0 or 1.
+        if bounded_accuracy:
+            lower = [max(0.0, value) for value in lower]
+            upper = [min(1.0, value) for value in upper]
+        axis.fill_between(
+            x_coordinates, lower, upper, color=color, alpha=0.12, zorder=1,
+        )
+        members = {run.run_id: run for run in context["groups"][group_id]}
+        seed_curves = sorted(
+            (run_id, seed_points)
+            for (raw_group, raw_line, run_id), seed_points in raw.items()
+            if (raw_group, raw_line) == (group_id, line)
+        )
+        for index, (run_id, seed_points) in enumerate(seed_curves):
+            seed_order = sorted(
+                seed_points,
+                key=_category_sort_key if categorical else lambda value: value,
+            )
+            short_id = run_id.split("__", 1)[0].replace("_", " ")
+            seed = dotted_get(members[run_id].manifest, "seed")
+            axis.plot(
+                plotted_x(seed_order), [seed_points[x] for x in seed_order],
+                color=color, linestyle=line_styles[index % len(line_styles)],
+                alpha=0.65, linewidth=1.2, zorder=3,
+                label=f"{label} · {short_id} · seed {seed}",
+            )
     axis.set_xlabel(xlabel)
-    axis.set_ylabel(ylabel)
-    axis.set_title(title)
+    axis.set_ylabel(ylabel.replace("_", " ").capitalize())
+    band_note = "Shading: ±1 sample SD across runs"
+    if bounded_accuracy:
+        band_note += " (display clipped to 0–1)"
+        axis.set_ylim(0.0, 1.02)
+    if len(series_names) == 1:
+        title += f" · {next(iter(series_names)).replace('_', ' ')}"
+    axis.set_title(
+        f"{title.replace('_', ' ')}\n"
+        f"Solid: mean · dashed/dotted: individual runs\n{band_note}",
+        fontsize=12,
+    )
     axis.grid(alpha=0.25)
     if category_positions is not None:
         axis.set_xticks(
@@ -2359,8 +3028,10 @@ def _plot_seed_curves(
             list(category_positions.keys()),
         )
     if aggregates:
-        axis.legend(fontsize="small")
-    figure.tight_layout()
+        axis.legend(
+            fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1),
+            borderaxespad=0, frameon=False, title="Models and runs",
+        )
     return figure
 
 
@@ -2820,6 +3491,51 @@ def make_parser() -> argparse.ArgumentParser:
     )
     _add_delayed_arguments(delayed_compare_parser)
     delayed_compare_parser.set_defaults(handler=command_delayed_compare)
+
+    recall_repeat_parser = subparsers.add_parser(
+        "recall-repeat-compare",
+        help=(
+            "Compare seed-paired one-pass and two-pass ground-truth and "
+            "internal delayed-recall accuracy at one horizon."
+        ),
+    )
+    _add_discovery_arguments(recall_repeat_parser)
+    recall_repeat_parser.add_argument(
+        "--run-id",
+        nargs="+",
+        default=None,
+        metavar="RUN_ID",
+        help="Exact one-pass and two-pass run IDs to compare.",
+    )
+    recall_repeat_parser.add_argument(
+        "--horizon",
+        type=int,
+        required=True,
+        help="Evolution horizon whose recall ages should be compared.",
+    )
+    recall_repeat_parser.add_argument(
+        "--split",
+        choices=("validation", "final_test"),
+        default="final_test",
+    )
+    recall_repeat_parser.add_argument(
+        "--checkpoint",
+        default="best_delayed_recall",
+        help=(
+            "Checkpoint type, normally best_delayed_recall. Use 'none' for "
+            "validation records or 'any' to disable checkpoint filtering."
+        ),
+    )
+    recall_repeat_parser.add_argument(
+        "--length", type=int, default=64, help="Evaluated row length."
+    )
+    recall_repeat_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional CSV/JSON comparison artifact directory.",
+    )
+    recall_repeat_parser.set_defaults(handler=command_recall_repeat_compare)
 
     delayed_leaderboard_parser = subparsers.add_parser(
         "delayed-leaderboard",

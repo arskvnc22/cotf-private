@@ -9,6 +9,12 @@ from contextlib import nullcontext
 from pathlib import Path
 import torch
 debug=False
+
+DELAYED_RECALL_SELECTION_TYPE = "delayed_recall_all_queries_pair_macro"
+INTERNAL_RECALL_SELECTION_TYPE = (
+    "delayed_recall_all_queries_internal_pair_macro"
+)
+
 def prindeb(statement):
     if debug ==True:
         print(statement)
@@ -33,6 +39,7 @@ try:
         evaluate_delayed_recall_pair,
         evaluate_delayed_recall_pairs,
         summarize_delayed_recall_pairs,
+        save_lstm_memory_diagnostics,
     )
     from .ca_forward import (
         FULL_CA_FORWARD_POLICY,
@@ -46,6 +53,7 @@ try:
     )
     from .ca_gen import apply_rule30, rollout_rule30
     from .ca_reporting import write_eval_metrics
+    from .ca_train import should_run_scheduled_evaluation
 except ImportError:
     from dca_eval import (
         ca_pair_key,
@@ -57,6 +65,7 @@ except ImportError:
         supports_clean_state_intervention,
         evaluate_delayed_recall_pairs,
         summarize_delayed_recall_pairs,
+        save_lstm_memory_diagnostics,
     )
     from ca_forward import (
         FULL_CA_FORWARD_POLICY,
@@ -67,6 +76,7 @@ except ImportError:
     from ca_exposure import add_training_exposure, rebuild_training_exposure
     from ca_gen import apply_rule30, rollout_rule30
     from ca_reporting import write_eval_metrics
+    from ca_train import should_run_scheduled_evaluation
 
 
 def _autocast_context(args):
@@ -170,14 +180,14 @@ def ca_selection_key(metrics, primary_metric):
 
 
 def delayed_recall_selection_key(summary, normal_metrics, primary_metric):
-    """Rank validation checkpoints on pair-balanced nontrivial recall."""
-    delayed = summary["nontrivial_queries_pair_macro"]
+    """Rank validation checkpoints on pair-balanced recall over all queries."""
+    delayed = summary["all_queries_pair_macro"]
     if primary_metric == "loss":
         primary = -_finite_or(delayed["loss"], math.inf)
     else:
         primary = _finite_or(delayed[primary_metric], -math.inf)
     worst_cell = _finite_or(
-        summary["worst_nontrivial_query"]["metrics"]["cell_accuracy"],
+        summary["worst_query"]["metrics"]["cell_accuracy"],
         -math.inf,
     )
     normal_cell = sum(
@@ -187,6 +197,30 @@ def delayed_recall_selection_key(summary, normal_metrics, primary_metric):
     return (
         primary,
         worst_cell,
+        _finite_or(delayed["exact_sequence_accuracy"], -math.inf),
+        normal_cell,
+        -_finite_or(delayed["loss"], math.inf),
+    )
+
+
+def internal_recall_selection_key(summary, normal_metrics):
+    """Rank checkpoints by final-to-requested internal cell agreement."""
+    internal = summary["all_internal_consistency_pair_macro"]
+    delayed = summary["all_queries_pair_macro"]
+    normal_cell = sum(
+        _finite_or(metrics["cell_accuracy"], -math.inf)
+        for metrics in normal_metrics
+    ) / len(normal_metrics)
+    return (
+        _finite_or(
+            internal["decoded_requested_repeat_cell_accuracy"],
+            -math.inf,
+        ),
+        _finite_or(
+            internal["decoded_requested_repeat_exact_sequence_accuracy"],
+            -math.inf,
+        ),
+        _finite_or(delayed["cell_accuracy"], -math.inf),
         _finite_or(delayed["exact_sequence_accuracy"], -math.inf),
         normal_cell,
         -_finite_or(delayed["loss"], math.inf),
@@ -450,21 +484,19 @@ def format_delayed_recall_lines(delayed_recall, *, split, step=None):
 
 
 def format_delayed_recall_summary(summary, *, split, step=None):
-    """Return the pair-balanced nontrivial delayed-recall headline."""
+    """Return the all-query pair-balanced checkpoint-selection headline."""
     if not summary:
         return ""
     step_text = f" step={step}" if step is not None else ""
-    ground_truth = summary["nontrivial_queries_pair_macro"]
-    retrieval = summary["nontrivial_ground_truth_retrieval_pair_macro"]
+    ground_truth = summary["all_queries_pair_macro"]
+    internal = summary["all_internal_consistency_pair_macro"]
     return (
-        f"DCA summary [{split}{step_text}] nontrivial pair macro | "
+        f"DCA summary [{split}{step_text}] all-query pair macro | "
         f"cell={_format_metric(ground_truth['cell_accuracy'])} "
         f"exact={_format_metric(ground_truth['exact_sequence_accuracy'])} "
         f"mcc={_format_metric(ground_truth['matthews_correlation'])} "
-        f"rank={_format_metric(retrieval['requested_repeat_mean_rank'])} "
-        f"mrr={_format_metric(retrieval['requested_repeat_mean_reciprocal_rank'])} "
-        f"margin={_format_metric(retrieval['requested_repeat_mean_margin_over_closest_wrong'])} "
-        f"unique_best={_format_metric(retrieval['requested_repeat_is_unique_best_rate'])}"
+        f"internal_cell={_format_metric(internal['decoded_requested_repeat_cell_accuracy'])} "
+        f"internal_exact={_format_metric(internal['decoded_requested_repeat_exact_sequence_accuracy'])}"
     )
 
 
@@ -769,6 +801,7 @@ def train_ca(
     stats_path = checkpoint_dir / "training_stats.json"
     best_id_path = checkpoint_dir / "best_id.json"
     best_delayed_recall_path = checkpoint_dir / "best_delayed_recall.json"
+    best_internal_recall_path = checkpoint_dir / "best_internal_recall.json"
     best_extrapolation_strict_path = (
         checkpoint_dir / "best_extrapolation_strict.json"
     )
@@ -785,6 +818,7 @@ def train_ca(
             "timing": [],
             "best_id": None,
             "best_delayed_recall": None,
+            "best_internal_recall": None,
             "best_extrapolation_strict": None,
             "best_extrapolation_unconstrained": None,
         },
@@ -794,6 +828,7 @@ def train_ca(
     )
     stats.setdefault("best_id", stats.get("best"))
     stats.setdefault("best_delayed_recall", None)
+    stats.setdefault("best_internal_recall", None)
     stats.setdefault(
         "best_extrapolation_strict", stats.get("best_extrapolation")
     )
@@ -802,6 +837,7 @@ def train_ca(
         best_id_path, _load_json(legacy_best_path, None)
     )
     best_delayed_recall_info = _load_json(best_delayed_recall_path, None)
+    best_internal_recall_info = _load_json(best_internal_recall_path, None)
     best_extrapolation_strict_info = _load_json(
         best_extrapolation_strict_path,
         _load_json(legacy_best_extrapolation_path, None),
@@ -840,9 +876,20 @@ def train_ca(
         best_id_info = None
         stats["best_id"] = None
         stats["best"] = None
-    if not selection_is_usable(best_delayed_recall_info):
+    if (
+        not selection_is_usable(best_delayed_recall_info)
+        or best_delayed_recall_info.get("selection_type")
+        != DELAYED_RECALL_SELECTION_TYPE
+    ):
         best_delayed_recall_info = None
         stats["best_delayed_recall"] = None
+    if (
+        not selection_is_usable(best_internal_recall_info)
+        or best_internal_recall_info.get("selection_type")
+        != INTERNAL_RECALL_SELECTION_TYPE
+    ):
+        best_internal_recall_info = None
+        stats["best_internal_recall"] = None
     if not selection_is_usable(best_extrapolation_strict_info):
         best_extrapolation_strict_info = None
         stats["best_extrapolation_strict"] = None
@@ -861,6 +908,11 @@ def train_ca(
         if best_delayed_recall_info is not None
         else None
     )
+    best_internal_recall_key = (
+        tuple(best_internal_recall_info["selection_key"])
+        if best_internal_recall_info is not None
+        else None
+    )
     best_extrapolation_strict_key = (
         tuple(best_extrapolation_strict_info["selection_key"])
         if best_extrapolation_strict_info is not None
@@ -874,6 +926,9 @@ def train_ca(
     best_id_checkpoint_path = checkpoint_dir / "best_id.pt"
     best_delayed_recall_checkpoint_path = (
         checkpoint_dir / "best_delayed_recall.pt"
+    )
+    best_internal_recall_checkpoint_path = (
+        checkpoint_dir / "best_internal_recall.pt"
     )
     best_extrapolation_strict_checkpoint_path = (
         checkpoint_dir / "best_extrapolation_strict.pt"
@@ -897,6 +952,7 @@ def train_ca(
     def evaluate_and_maybe_select(step):
         nonlocal best_id_info, best_id_key
         nonlocal best_delayed_recall_info, best_delayed_recall_key
+        nonlocal best_internal_recall_info, best_internal_recall_key
         nonlocal best_extrapolation_strict_info
         nonlocal best_extrapolation_strict_key
         nonlocal best_extrapolation_unconstrained_info
@@ -927,6 +983,7 @@ def train_ca(
                 eval_loader,
                 args.device,
                 pairs=train_pairs,
+                num_recall_repeats=args.ca_recall_repeats,
                 max_batches=args.ca_eval_max_batches,
                 num_examples=2,
                 ctx=_autocast_context(args),
@@ -945,6 +1002,51 @@ def train_ca(
             delayed_recall_summary = summarize_delayed_recall_pairs(
                 delayed_recall_eval
             )
+            lstm_memory_diagnostics = None
+            memory_diagnostic_requested = (
+                args.dca_lstm_memory_evolution_repeats is not None
+                or args.dca_lstm_memory_recall_steps is not None
+            )
+
+            if memory_diagnostic_requested:
+                artifact_root = (
+                    Path(args.ca_run_dir)
+                    if args.ca_run_dir is not None
+                    else checkpoint_dir
+                )
+                artifact_path = (
+                    artifact_root
+                    / "lstm_memory"
+                    / f"eval_step_{step:08d}.pt"
+                )
+
+                lstm_memory_diagnostics = save_lstm_memory_diagnostics(
+                    evaluation_forward,
+                    eval_loader,
+                    args.device,
+                    num_repeats=best_pair[1],
+                    num_recall_repeats=args.ca_recall_repeats,
+                    evolution_repeats=(
+                        args.dca_lstm_memory_evolution_repeats or ()
+                    ),
+                    recall_steps=(
+                        args.dca_lstm_memory_recall_steps or ()
+                    ),
+                    query_repeats=(
+                        args.dca_lstm_memory_query_repeats
+                    ),
+                    num_examples=args.dca_lstm_memory_examples,
+                    artifact_path=artifact_path,
+                    ctx=_autocast_context(args),
+                )
+
+                _trainer_print(
+                    args,
+                    "Saved LSTM memory diagnostic:",
+                    lstm_memory_diagnostics["artifact_path"],
+                )
+
+
             eval_record = {
                 "in_distribution": in_distribution_eval,
                 "delayed_recall": delayed_recall_eval,
@@ -955,6 +1057,7 @@ def train_ca(
                     args, delayed_pair_counters
                 ),
                 "training_exposure": copy.deepcopy(training_exposure),
+                "lstm_memory_diagnostics": lstm_memory_diagnostics,
             }
             stats["eval"][str(step)] = eval_record
 
@@ -1003,10 +1106,11 @@ def train_ca(
             ):
                 best_delayed_recall_key = delayed_candidate_key
                 delayed_metrics = delayed_recall_summary[
-                    "nontrivial_queries_pair_macro"
+                    "all_queries_pair_macro"
                 ]
                 best_delayed_recall_info = {
                     "step": int(step),
+                    "num_recall_repeats": args.ca_recall_repeats,
                     "length": best_length,
                     "metric": args.ca_delayed_best_metric,
                     "value": float(
@@ -1014,7 +1118,9 @@ def train_ca(
                     ),
                     "selection_key": list(delayed_candidate_key),
                     "checkpoint": best_delayed_recall_checkpoint_path.name,
-                    "selection_type": "delayed_recall_nontrivial_pair_macro",
+                    "selection_type": DELAYED_RECALL_SELECTION_TYPE,
+                    "pairs": delayed_recall_summary["pairs"],
+                    "all_queries": delayed_recall_summary["all_queries"],
                     "eligible_pairs": delayed_recall_summary[
                         "eligible_pairs"
                     ],
@@ -1022,10 +1128,10 @@ def train_ca(
                         "nontrivial_queries"
                     ],
                     "internal_consistency": delayed_recall_summary[
-                        "nontrivial_internal_consistency_pair_macro"
+                        "all_internal_consistency_pair_macro"
                     ],
                     "ground_truth_retrieval": delayed_recall_summary[
-                        "nontrivial_ground_truth_retrieval_pair_macro"
+                        "all_ground_truth_retrieval_pair_macro"
                     ],
                     "forward_policy": forward_policy_metadata,
                 }
@@ -1039,6 +1145,57 @@ def train_ca(
                 _write_json(
                     best_delayed_recall_path,
                     best_delayed_recall_info,
+                )
+
+            internal_candidate_key = internal_recall_selection_key(
+                delayed_recall_summary,
+                id_selection_metrics,
+            )
+            if (
+                best_internal_recall_key is None
+                or internal_candidate_key > best_internal_recall_key
+            ):
+                best_internal_recall_key = internal_candidate_key
+                internal_metrics = delayed_recall_summary[
+                    "all_internal_consistency_pair_macro"
+                ]
+                best_internal_recall_info = {
+                    "step": int(step),
+                    "num_recall_repeats": args.ca_recall_repeats,
+                    "length": best_length,
+                    "metric": "decoded_requested_repeat_cell_accuracy",
+                    "value": float(
+                        internal_metrics[
+                            "decoded_requested_repeat_cell_accuracy"
+                        ]
+                    ),
+                    "selection_key": list(internal_candidate_key),
+                    "checkpoint": best_internal_recall_checkpoint_path.name,
+                    "selection_type": INTERNAL_RECALL_SELECTION_TYPE,
+                    "pairs": delayed_recall_summary["pairs"],
+                    "all_queries": delayed_recall_summary["all_queries"],
+                    "eligible_pairs": delayed_recall_summary[
+                        "eligible_pairs"
+                    ],
+                    "nontrivial_queries": delayed_recall_summary[
+                        "nontrivial_queries"
+                    ],
+                    "internal_consistency": internal_metrics,
+                    "ground_truth": delayed_recall_summary[
+                        "all_queries_pair_macro"
+                    ],
+                    "forward_policy": forward_policy_metadata,
+                }
+                save_model_checkpoint(
+                    best_internal_recall_checkpoint_path,
+                    model=raw_model,
+                    step=step,
+                    metadata=best_internal_recall_info,
+                )
+                stats["best_internal_recall"] = best_internal_recall_info
+                _write_json(
+                    best_internal_recall_path,
+                    best_internal_recall_info,
                 )
 
             _trainer_print(
@@ -1071,6 +1228,7 @@ def train_ca(
                 format_checkpoint_selections(
                     ("best_id", best_id_info),
                     ("best_delayed_recall", best_delayed_recall_info),
+                    ("best_internal_recall", best_internal_recall_info),
                 ),
             )
             logs = {"iter": step}
@@ -1391,7 +1549,7 @@ def train_ca(
         distributed_backend.sync()
 
     for step in range(start_step, args.iterations):
-        if step % args.eval_freq == 0:
+        if should_run_scheduled_evaluation(step, args.eval_freq):
             prindeb("==========RUNNNING EVALUATION FORWARDS======")
             prindeb("==========RUNNNING EVALUATION FORWARDS======")
             prindeb("==========RUNNNING EVALUATION FORWARDS======")
@@ -1458,16 +1616,19 @@ def train_ca(
                     else:
                         labels = targets_by_repeat[:, -1]
 
-       
+                
             forward_kwargs = {
-                "targets": None, # for delayed ca loss is calculated explicitly in the trainer due there being 2 objectivs
+                "targets": None,
                 "get_logits": is_delayed,
-                "return_all_logits":is_delayed,
+                "return_all_logits": is_delayed,
                 "num_repeats": evolution_repeats,
                 "delayed_recall": is_delayed,
                 "recall_age": recall_age,
                 "return_repeat_logits": True,
             }
+
+            if is_delayed:
+                forward_kwargs["num_recall_repeats"] = args.ca_recall_repeats
 
             if active_pair is not None:
                 forward_kwargs["num_repeats"] = evolution_repeats
@@ -1597,7 +1758,7 @@ def train_ca(
             "query_repeat": query_repeat,
             "recall_age": recall_age,
             "target_steps": target_steps,
-            "executed_repeats": evolution_repeats + int(is_delayed),
+            "executed_repeats": evolution_repeats+(args.ca_recall_repeats if is_delayed else 0),
             "microbatches_this_step": microbatches_this_step,
             "examples_this_step": examples_this_step,
             "cells_this_step": cells_this_step,
@@ -1837,6 +1998,10 @@ def train_ca(
             raise RuntimeError(
                 "CA training completed without selecting a delayed-recall checkpoint."
             )
+        if best_internal_recall_info is None:
+            raise RuntimeError(
+                "CA training completed without selecting an internal-recall checkpoint."
+            )
 
         supports_repeat_override = (
             "num_repeats" in inspect.signature(raw_model.forward).parameters
@@ -1883,31 +2048,46 @@ def train_ca(
             "best_id",
         )
         final_eval = best_id_checkpoint_eval["task_metrics"]
-        best_delayed_recall_checkpoint_eval = evaluate_checkpoint(
-            checkpoint_dir / best_delayed_recall_info["checkpoint"],
+
+        def evaluate_recall_checkpoint(metadata, label):
+            checkpoint_eval = evaluate_checkpoint(
+                checkpoint_dir / metadata["checkpoint"],
+                metadata,
+                label,
+            )
+            recall_eval = evaluate_delayed_recall_pairs(
+                evaluation_forward,
+                test_loaders[best_length],
+                args.device,
+                pairs=train_pairs,
+                num_recall_repeats=args.ca_recall_repeats,
+                max_batches=(
+                    args.ca_final_eval_max_batches
+                    or args.ca_eval_max_batches
+                ),
+                num_examples=2,
+                ctx=_autocast_context(args),
+            )
+            recall_summary = summarize_delayed_recall_pairs(recall_eval)
+            checkpoint_eval["delayed_recall"] = recall_eval
+            checkpoint_eval["delayed_recall_summary"] = recall_summary
+            return checkpoint_eval, recall_eval, recall_summary
+
+        (
+            best_delayed_recall_checkpoint_eval,
+            delayed_test_eval,
+            delayed_test_summary,
+        ) = evaluate_recall_checkpoint(
             best_delayed_recall_info,
             "best_delayed_recall",
         )
-        delayed_test_eval = evaluate_delayed_recall_pairs(
-            evaluation_forward,
-            test_loaders[best_length],
-            args.device,
-            pairs=train_pairs,
-            max_batches=(
-                args.ca_final_eval_max_batches
-                or args.ca_eval_max_batches
-            ),
-            num_examples=2,
-            ctx=_autocast_context(args),
-        )
-        delayed_test_summary = summarize_delayed_recall_pairs(
-            delayed_test_eval
-        )
-        best_delayed_recall_checkpoint_eval["delayed_recall"] = (
-            delayed_test_eval
-        )
-        best_delayed_recall_checkpoint_eval["delayed_recall_summary"] = (
-            delayed_test_summary
+        (
+            best_internal_recall_checkpoint_eval,
+            internal_test_eval,
+            internal_test_summary,
+        ) = evaluate_recall_checkpoint(
+            best_internal_recall_info,
+            "best_internal_recall",
         )
         best_extrapolation_strict_checkpoint_eval = None
         if best_extrapolation_strict_info is not None:
@@ -1927,6 +2107,7 @@ def train_ca(
 
         stats["best_id"] = best_id_info
         stats["best_delayed_recall"] = best_delayed_recall_info
+        stats["best_internal_recall"] = best_internal_recall_info
         stats["best_extrapolation_strict"] = best_extrapolation_strict_info
         stats["best_extrapolation_unconstrained"] = (
             best_extrapolation_unconstrained_info
@@ -1938,6 +2119,7 @@ def train_ca(
         stats["checkpoint_analysis"] = {
             "best_id": best_id_checkpoint_eval,
             "best_delayed_recall": best_delayed_recall_checkpoint_eval,
+            "best_internal_recall": best_internal_recall_checkpoint_eval,
             "best_extrapolation_strict": (
                 best_extrapolation_strict_checkpoint_eval
             ),
@@ -1954,6 +2136,10 @@ def train_ca(
         _write_json(
             checkpoint_dir / "best_delayed_recall_eval.json",
             best_delayed_recall_checkpoint_eval,
+        )
+        _write_json(
+            checkpoint_dir / "best_internal_recall_eval.json",
+            best_internal_recall_checkpoint_eval,
         )
         _write_json(
             checkpoint_dir / "best_id_repeat_diagnostics.json",
@@ -2006,6 +2192,7 @@ def train_ca(
             "iter": args.iterations,
             "best_id/step": best_id_info["step"],
             "best_delayed_recall/step": best_delayed_recall_info["step"],
+            "best_internal_recall/step": best_internal_recall_info["step"],
             "best/step": best_id_info["step"],
         }
         add_scalar_metrics(final_logs, final_eval, prefix="final_best_id")
@@ -2014,6 +2201,11 @@ def train_ca(
             final_logs,
             delayed_test_summary,
             prefix="final_best_delayed_recall",
+        )
+        add_scalar_metrics(
+            final_logs,
+            internal_test_summary,
+            prefix="final_best_internal_recall",
         )
         if best_extrapolation_strict_checkpoint_eval is not None:
             final_logs["best_extrapolation_strict/step"] = (
@@ -2068,9 +2260,24 @@ def train_ca(
         )
         _trainer_print(
             args,
+            format_delayed_recall_lines(
+                internal_test_eval,
+                split="final_test_best_internal_recall",
+            ),
+        )
+        _trainer_print(
+            args,
+            format_delayed_recall_summary(
+                internal_test_summary,
+                split="final_test_best_internal_recall",
+            ),
+        )
+        _trainer_print(
+            args,
             format_checkpoint_selections(
                 ("best_id", best_id_info),
                 ("best_delayed_recall", best_delayed_recall_info),
+                ("best_internal_recall", best_internal_recall_info),
                 ("best_extrapolation_strict", best_extrapolation_strict_info),
                 (
                     "best_extrapolation_unconstrained",

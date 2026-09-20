@@ -17,11 +17,7 @@ from torch.nn import functional as F
 
 from . import positional_encoders, caches
 from .utils import LayerNorm
-debug = False
 
-def prindeb(statement):
-    if debug==True:
-        print(statement)
 class InPlaceSetSlice(torch.autograd.Function):
     @staticmethod
     def forward(ctx, full_tensor, last_slice, x_val, dim):
@@ -181,6 +177,63 @@ class MLP(nn.Module):
         return x
 
 
+# class Block(nn.Module):
+
+#     def __init__(self, config, lm_cache):
+#         super().__init__()
+#         self.config = config
+#         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+#         self.attn = CausalSelfAttention(config, lm_cache)
+#         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+#         self.mlp = MLP(config)
+#         self.memory_gate_norm = nn.LayerNorm(config.n_embd)
+
+#         self.x_to_forget = nn.Linear(config.n_embd,config.n_embd,bias=config.x_to_forget_bias)
+#         self.h_to_forget = nn.Linear(config.n_embd,config.n_embd,bias=config.h_to_forget_bias)
+
+#         self.x_to_write = nn.Linear(config.n_embd,config.n_embd,bias=config.x_to_write_bias)
+#         self.h_to_write = nn.Linear(config.n_embd,config.n_embd,bias=config.h_to_write_bias)
+
+#         self.x_to_memory_proposal = nn.Linear(config.n_embd,config.n_embd,bias=config.x_to_memory_proposal_bias)
+#         self.h_to_memory_proposal = nn.Linear(config.n_embd,config.n_embd,bias=config.h_to_memory_proposal_bias)
+
+#         self.x_to_hidden = nn.Linear(config.n_embd,config.n_embd,bias=config.add_to_hidden_bias)
+#         self.h_to_hidden = nn.Linear(config.n_embd,config.n_embd,bias=config.add_to_hidden_bias)
+
+
+#     def forward(self, x, c, pos_emb_closure, cache_context, start_index, indices=None):
+#         previous_hidden=self.memory_gate_norm(x)
+#         x = x + self.attn(self.ln_1(x), pos_emb_closure, cache_context, start_index)
+#         x = x + self.mlp(self.ln_2(x))
+#         proposed_hidden = self.memory_gate_norm(x)
+
+#         forget_gate = torch.sigmoid(self.x_to_forget(previous_hidden) + self.h_to_forget(proposed_hidden))
+
+#         retained_memory = forget_gate*c
+
+#         write_gate = torch.sigmoid(self.x_to_write(previous_hidden) + self.h_to_write(proposed_hidden))
+
+#         memory_proposal = torch.tanh(self.x_to_memory_proposal(previous_hidden) + self.h_to_memory_proposal(proposed_hidden))
+
+#         memory_write = write_gate*memory_proposal
+
+#         c= retained_memory + memory_write
+
+#         hidden_update = torch.sigmoid(self.x_to_hidden(previous_hidden) + self.h_to_hidden(proposed_hidden))
+
+#         exposed_memory = torch.tanh(c)
+
+#         x = proposed_hidden + hidden_update*exposed_memory
+
+
+
+#         return x, c
+
+
+
+
+
+
 class Block(nn.Module):
 
     def __init__(self, config, lm_cache):
@@ -190,34 +243,165 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, lm_cache)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
+        self.memory_gate_norm = nn.LayerNorm(config.n_embd)
 
-    def forward(self, x, pos_emb_closure, cache_context, start_index, indices=None):
-        x = x + self.attn(self.ln_1(x), pos_emb_closure, cache_context, start_index)
+        self.forget_gate_mode = config.lstm_forget_gate
+        self.control_input = config.lstm_control_input
+
+        if self.forget_gate_mode not in ("learned", "none"):
+            raise ValueError(
+                f"Unsupported lstm_forget_gate: {self.forget_gate_mode}"
+            )
+        if self.control_input not in (
+            "previous_and_proposed",
+            "proposed",
+        ):
+            raise ValueError(
+                f"Unsupported lstm_control_input: {self.control_input}"
+            )
+
+        use_previous_hidden = (
+            self.control_input == "previous_and_proposed"
+        )
+
+        def previous_projection():
+            if not use_previous_hidden:
+                return None
+            return nn.Linear(
+                config.n_embd,
+                config.n_embd,
+                bias=config.bias,
+            )
+
+        def proposed_projection():
+            return nn.Linear(
+                config.n_embd,
+                config.n_embd,
+                bias=config.bias,
+            )
+
+        if self.forget_gate_mode == "learned":
+            self.previous_to_forget = previous_projection()
+            self.proposed_to_forget = proposed_projection()
+        else:
+            self.previous_to_forget = None
+            self.proposed_to_forget = None
+
+        self.previous_to_write = previous_projection()
+        self.proposed_to_write = proposed_projection()
+
+        self.previous_to_memory_proposal = previous_projection()
+        self.proposed_to_memory_proposal = proposed_projection()
+
+        self.previous_to_hidden = previous_projection()
+        self.proposed_to_hidden = proposed_projection()
+
+    @staticmethod
+    def _control_projection(
+        previous_hidden,
+        proposed_hidden,
+        previous_projection,
+        proposed_projection,
+    ):
+        value = proposed_projection(proposed_hidden)
+        if previous_projection is not None:
+            value = value + previous_projection(previous_hidden)
+        return value
+
+    def forward(
+        self,
+        x,
+        cell,
+        pos_emb_closure,
+        cache_context,
+        start_index,
+        indices=None,
+    ):
+        del indices
+
+        previous_hidden = self.memory_gate_norm(x)
+
+        x = x + self.attn(
+            self.ln_1(x),
+            pos_emb_closure,
+            cache_context,
+            start_index,
+        )
         x = x + self.mlp(self.ln_2(x))
-        return x
+
+        proposed_hidden = self.memory_gate_norm(x)
+
+        if self.forget_gate_mode == "learned":
+            forget_gate = torch.sigmoid(
+                self._control_projection(
+                    previous_hidden,
+                    proposed_hidden,
+                    self.previous_to_forget,
+                    self.proposed_to_forget,
+                )
+            )
+            retained_memory = forget_gate * cell
+        else:
+            # No forget gate means exact additive retention.
+            retained_memory = cell
+
+        write_gate = torch.sigmoid(
+            self._control_projection(
+                previous_hidden,
+                proposed_hidden,
+                self.previous_to_write,
+                self.proposed_to_write,
+            )
+        )
+
+        memory_proposal = torch.tanh(
+            self._control_projection(
+                previous_hidden,
+                proposed_hidden,
+                self.previous_to_memory_proposal,
+                self.proposed_to_memory_proposal,
+            )
+        )
+
+        cell = retained_memory + write_gate * memory_proposal
+
+        hidden_gate = torch.sigmoid(
+            self._control_projection(
+                previous_hidden,
+                proposed_hidden,
+                self.previous_to_hidden,
+                self.proposed_to_hidden,
+            )
+        )
+
+        x = x + hidden_gate * torch.tanh(cell) # should x be replaced by proposed hidden? # TODO
+        return x, cell
+
 class ForwardBackwardEmbedding(nn.Module):
     FORWARD = 0
     RECALL = 1
 
     def __init__(self, config):
         super().__init__()
-        self.embd = nn.Embedding(2, config.n_embd)
+        self.embedding = nn.Embedding(2, config.n_embd)
 
     def forward(self, direction_ids):
-        # [B] -> [B, D] -> [B, 1, D]
-        return self.embd(direction_ids).unsqueeze(1)
+        return self.embedding(direction_ids).unsqueeze(1)
+
+
 class RelativeAgeEmbedding(nn.Module):
+
     def __init__(self, config):
         super().__init__()
-
-        self.embd = nn.Embedding(
+        self.embedding = nn.Embedding(
             config.ca_max_relative_age + 1,
             config.n_embd,
         )
 
     def forward(self, age_ids):
-        # [B] -> [B, D] -> [B, 1, D]
-        return self.embd(age_ids).unsqueeze(1)
+        return self.embedding(age_ids).unsqueeze(1)
+
+
 class GPTBase(nn.Module):
 
     needs_iter = False
@@ -229,10 +413,22 @@ class GPTBase(nn.Module):
         self.config = config
         self.tokenizer = tiktoken.get_encoding("gpt2")
         self.n_repeat = config.n_repeat
-        self.direction_embedding = ForwardBackwardEmbedding(config)
-        self.age_embedding = RelativeAgeEmbedding(config)
+        self.delayed_recall_enabled = (
+            config.model == "dca_lstm_ut"
+        )
 
-        self.controller_application = config.ca_controller_application
+        if self.delayed_recall_enabled:
+            if getattr(config, "ca_max_relative_age", None) is None:
+                raise ValueError(
+                    "dca_lstm_ut requires ca_max_relative_age."
+                )
+
+            self.direction_embedding = ForwardBackwardEmbedding(config)
+            self.age_embedding = RelativeAgeEmbedding(config)
+            self.controller_application = config.ca_controller_application
+
+
+        
         self.lm_cache = caches.get_cache(config.lm_cache)(config)
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -314,8 +510,13 @@ class GPTBase(nn.Module):
         return_repeat_logits=False,
         delayed_recall = False,
         recall_age=None,
-        num_recall_repeats=1
-    ):
+        num_recall_repeats=1,
+        return_memory_states=False,
+        memory_evolution_repeats=None,
+        memory_recall_steps=None,
+
+
+        ):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
@@ -347,6 +548,59 @@ class GPTBase(nn.Module):
                 f"num_repeats={repeats} exceeds "
                 f"ca_max_relative_age={self.config.ca_max_relative_age}."
             )
+        memory_states = None
+        captured_evolution_repeats = set()
+        captured_recall_steps = set()
+
+        if return_memory_states:
+            if memory_evolution_repeats is None:
+                captured_evolution_repeats = set(
+                    range(1, repeats + 1)
+                )
+            else:
+                captured_evolution_repeats = {
+                    int(value) for value in memory_evolution_repeats
+                }
+
+            if delayed_recall:
+                if memory_recall_steps is None:
+                    captured_recall_steps = set(
+                        range(1, recall_repeats + 1)
+                    )
+                else:
+                    captured_recall_steps = {
+                        int(value) for value in memory_recall_steps
+                    }
+
+            invalid_evolution_repeats = sorted(
+                repeat
+                for repeat in captured_evolution_repeats
+                if repeat < 1 or repeat > repeats
+            )
+            if invalid_evolution_repeats:
+                raise ValueError(
+                    "Requested memory evolution repeats are outside the "
+                    f"executed range 1..{repeats}: "
+                    f"{invalid_evolution_repeats}."
+                )
+
+            invalid_recall_steps = sorted(
+                step
+                for step in captured_recall_steps
+                if step < 1 or step > recall_repeats
+            )
+            if invalid_recall_steps:
+                raise ValueError(
+                    "Requested memory recall steps are outside the "
+                    f"executed range 1..{recall_repeats}: "
+                    f"{invalid_recall_steps}."
+                )
+
+            memory_states = {
+                "evolution": {},
+                "recall": {},
+            }
+
         def make_ids(value):
             return torch.full(
                 (b,),
@@ -354,6 +608,18 @@ class GPTBase(nn.Module):
                 device=idx.device,
                 dtype=torch.long,
             )
+#        cell = torch.zeros_like(x)
+
+        def run_blocks(hidden, cell, blocks):
+            for block in blocks:
+                hidden, cell = block(
+                    hidden,
+                    cell,
+                    pos_emb_closure,
+                    cache_context,
+                    start_index=index_shift,
+                )
+            return hidden, cell
 
 
         def make_controller(direction, relative_age):
@@ -381,9 +647,18 @@ class GPTBase(nn.Module):
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         x = self.transformer.drop(x)
         x = pos_emb_closure.adapt_model_input(x, start_index=index_shift) # does nothign with rope index shift is for autoregressive generation which we don't intend to use we dont have lm cacahe anywyay its annoying
-       
-        for block in self.transformer.h_begin:
-            x = block(x, pos_emb_closure, cache_context, start_index=index_shift)
+    
+        # for block in self.transformer.h_begin:
+        #     x = block(x, pos_emb_closure, cache_context, start_index=index_shift)
+
+        cell = torch.zeros_like(x)
+
+        x, cell = run_blocks(
+            x,
+            cell,
+            self.transformer.h_begin,
+        )
+
 
         # Evaluation-only repeat diagnostics use these snapshots to determine
         # whether the shared middle stack converges, cycles, or leaves the
@@ -409,16 +684,21 @@ class GPTBase(nn.Module):
 
             x = x + controller
 
-            for block in self.transformer.h_mid:
-                x = block(
-                    x,
-                    pos_emb_closure,
-                    cache_context,
-                    start_index=index_shift,
-                )
+            x, cell = run_blocks(
+                x,
+                cell,
+                self.transformer.h_mid,
+            )
+
 
             if self.controller_application == "subtract":
                 x = x - controller
+            if (
+                return_memory_states
+                and rep_idx in captured_evolution_repeats
+            ):
+                memory_states["evolution"][rep_idx] = cell.detach()
+
 
             if return_repeat_states:
                 repeat_states.append(x)
@@ -435,23 +715,30 @@ class GPTBase(nn.Module):
                 ForwardBackwardEmbedding.RECALL,
                 recall_age,
             )
-            for _ in range(recall_repeats):
+            for recall_step in range(1, recall_repeats + 1):
                     
                 x = x + controller
 
-                for block in self.transformer.h_mid:
-                    x = block(
-                        x,
-                        pos_emb_closure,
-                        cache_context,
-                        start_index=index_shift,
-                    )
+                x, cell = run_blocks(
+                    x,
+                    cell,
+                    self.transformer.h_mid,
+                )
 
                 if self.controller_application == "subtract":
                     x = x - controller
-        for block in self.transformer.h_end:
-            x = block(x, pos_emb_closure, cache_context, start_index=index_shift)
-            
+                if (
+                    return_memory_states
+                    and recall_step in captured_recall_steps
+                ):
+                    memory_states["recall"][recall_step] = cell.detach()
+
+
+        x, cell = run_blocks(
+            x,
+            cell,
+            self.transformer.h_end,
+        )
         x = self.transformer.ln_f(x)
 
         if use_cache:
@@ -469,7 +756,6 @@ class GPTBase(nn.Module):
             loss = None
         logits = logits if get_logits else None
         executed_repeats = repeats + (recall_repeats if delayed_recall else 0)
-        prindeb(f"exec repeats {executed_repeats}")
 
         average_depth = ( # deph accounting
             executed_repeats * len(self.transformer.h_mid)
@@ -481,6 +767,10 @@ class GPTBase(nn.Module):
             'loss': loss,
             'average_depth': torch.as_tensor(average_depth, device=idx.device),
         }
+        if return_memory_states:
+            result["memory_states"] = memory_states
+
+
         if return_repeat_states:
             result['repeat_states'] = repeat_states
         if return_repeat_logits:

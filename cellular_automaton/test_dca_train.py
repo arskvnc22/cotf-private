@@ -10,6 +10,7 @@ from cellular_automaton.ca_delayed_train import (
     delayed_schedule_state_dict,
     format_checkpoint_selections,
     format_delayed_recall_lines,
+    internal_recall_selection_key,
     make_delayed_pair_counters,
     restore_delayed_pair_counters,
     training_pair_for_step,
@@ -43,6 +44,7 @@ class _SameRunOracle(torch.nn.Module):
         return_repeat_states,
         get_logits,
         return_all_logits,
+        num_recall_repeats,
     ):
         del delayed_recall, get_logits, return_all_logits
         state = inputs
@@ -57,7 +59,9 @@ class _SameRunOracle(torch.nn.Module):
         return {
             "logits": repeat_states[query_repeat],
             "repeat_states": repeat_states if return_repeat_states else None,
-            "average_depth": torch.tensor(float(num_repeats + 1)),
+            "average_depth": torch.tensor(
+                float(num_repeats + num_recall_repeats)
+            ),
         }
 
 
@@ -85,13 +89,26 @@ def _query(num_repeats, query_repeat, accuracy):
 
 
 def _pair(num_repeats, nontrivial_accuracy, internal_accuracy=0.8):
+    all_accuracy = (nontrivial_accuracy + 1.0) / 2.0
+    all_internal_accuracy = (internal_accuracy + 1.0) / 2.0
     queries = {
         "query_repeat_1": _query(num_repeats, 1, nontrivial_accuracy),
         f"query_repeat_{num_repeats}": _query(num_repeats, num_repeats, 1.0),
     }
     return {
         "queries": queries,
+        "all_queries_macro": _metrics(all_accuracy),
         "nontrivial_queries_macro": _metrics(nontrivial_accuracy),
+        "all_queries_internal_consistency_macro": {
+            "decoded_requested_repeat_cell_accuracy": all_internal_accuracy,
+            "decoded_requested_repeat_exact_sequence_accuracy": (
+                all_internal_accuracy
+            ),
+            "requested_repeat_logit_cosine_similarity": all_internal_accuracy,
+            "requested_repeat_logit_normalized_mse": 1.0 - all_internal_accuracy,
+            "requested_repeat_is_best_cosine_rate": all_internal_accuracy,
+            "requested_repeat_is_unique_best_cosine_rate": all_internal_accuracy,
+        },
         "nontrivial_internal_consistency_macro": {
             "decoded_requested_repeat_cell_accuracy": internal_accuracy,
             "decoded_requested_repeat_exact_sequence_accuracy": internal_accuracy,
@@ -99,6 +116,14 @@ def _pair(num_repeats, nontrivial_accuracy, internal_accuracy=0.8):
             "requested_repeat_logit_normalized_mse": 1.0 - internal_accuracy,
             "requested_repeat_is_best_cosine_rate": internal_accuracy,
             "requested_repeat_is_unique_best_cosine_rate": internal_accuracy,
+        },
+        "all_queries_ground_truth_retrieval_macro": {
+            "requested_repeat_is_best_rate": all_accuracy,
+            "requested_repeat_is_unique_best_rate": all_accuracy,
+            "requested_repeat_mean_rank": 1.0,
+            "requested_repeat_mean_reciprocal_rank": all_accuracy,
+            "requested_repeat_mean_margin_over_closest_wrong": 0.1,
+            "requested_repeat_positive_margin_rate": all_accuracy,
         },
         "nontrivial_ground_truth_retrieval_macro": {
             "requested_repeat_is_best_rate": nontrivial_accuracy,
@@ -111,30 +136,74 @@ def _pair(num_repeats, nontrivial_accuracy, internal_accuracy=0.8):
     }
 
 
-def test_delayed_summary_is_pair_balanced_and_excludes_no_op_queries():
+def _trivial_pair():
+    query = _query(1, 1, 1.0)
+    return {
+        "queries": {"query_repeat_1": query},
+        "all_queries_macro": _metrics(1.0),
+        "nontrivial_queries_macro": None,
+        "all_queries_internal_consistency_macro": {
+            "decoded_requested_repeat_cell_accuracy": 1.0,
+            "decoded_requested_repeat_exact_sequence_accuracy": 1.0,
+        },
+        "nontrivial_internal_consistency_macro": None,
+        "all_queries_ground_truth_retrieval_macro": {
+            "requested_repeat_is_best_rate": 1.0,
+            "requested_repeat_is_unique_best_rate": 1.0,
+            "requested_repeat_mean_rank": 1.0,
+            "requested_repeat_mean_reciprocal_rank": 1.0,
+        },
+        "nontrivial_ground_truth_retrieval_macro": None,
+    }
+
+
+def test_delayed_summary_reports_all_and_nontrivial_pair_balanced_macros():
     summary = summarize_delayed_recall_pairs(
         {
+            "steps_1_repeats_1": _trivial_pair(),
             "steps_2_repeats_2": _pair(2, 0.5),
             "steps_5_repeats_5": _pair(5, 0.9),
         }
     )
 
+    assert summary["pairs"] == 3
     assert summary["eligible_pairs"] == 2
     assert summary["nontrivial_queries"] == 2
     assert summary["nontrivial_queries_pair_macro"]["cell_accuracy"] == pytest.approx(
         0.7
     )
+    assert summary["all_queries_pair_macro"]["cell_accuracy"] == pytest.approx(
+        0.9
+    )
+    assert summary["all_internal_consistency_pair_macro"][
+        "decoded_requested_repeat_cell_accuracy"
+    ] == pytest.approx(2.8 / 3.0)
+    assert summary["all_queries"] == 5
     assert summary["worst_nontrivial_query"]["metrics"]["cell_accuracy"] == 0.5
+
+
+def test_delayed_summary_supports_only_trivial_recall():
+    summary = summarize_delayed_recall_pairs(
+        {"steps_1_repeats_1": _trivial_pair()}
+    )
+
+    assert summary["pairs"] == 1
+    assert summary["all_queries"] == 1
+    assert summary["eligible_pairs"] == 0
+    assert summary["nontrivial_queries"] == 0
+    assert summary["all_queries_pair_macro"]["cell_accuracy"] == 1.0
+    assert summary["nontrivial_queries_pair_macro"] is None
+    assert summary["worst_nontrivial_query"] is None
 
 
 def test_delayed_selection_uses_recall_before_normal_accuracy():
     weaker_recall = {
-        "nontrivial_queries_pair_macro": _metrics(0.7),
-        "worst_nontrivial_query": {"metrics": _metrics(0.7)},
+        "all_queries_pair_macro": _metrics(0.7),
+        "worst_query": {"metrics": _metrics(0.7)},
     }
     stronger_recall = {
-        "nontrivial_queries_pair_macro": _metrics(0.8),
-        "worst_nontrivial_query": {"metrics": _metrics(0.8)},
+        "all_queries_pair_macro": _metrics(0.8),
+        "worst_query": {"metrics": _metrics(0.8)},
     }
     perfect_normal = [_metrics(1.0)]
     weak_normal = [_metrics(0.4)]
@@ -143,6 +212,29 @@ def test_delayed_selection_uses_recall_before_normal_accuracy():
         stronger_recall, weak_normal, "cell_accuracy"
     ) > delayed_recall_selection_key(
         weaker_recall, perfect_normal, "cell_accuracy"
+    )
+
+
+def test_internal_selection_uses_all_query_cell_agreement_first():
+    weaker_internal = {
+        "all_internal_consistency_pair_macro": {
+            "decoded_requested_repeat_cell_accuracy": 0.7,
+            "decoded_requested_repeat_exact_sequence_accuracy": 0.9,
+        },
+        "all_queries_pair_macro": _metrics(1.0),
+    }
+    stronger_internal = {
+        "all_internal_consistency_pair_macro": {
+            "decoded_requested_repeat_cell_accuracy": 0.8,
+            "decoded_requested_repeat_exact_sequence_accuracy": 0.1,
+        },
+        "all_queries_pair_macro": _metrics(0.2),
+    }
+
+    assert internal_recall_selection_key(
+        stronger_internal, [_metrics(0.2)]
+    ) > internal_recall_selection_key(
+        weaker_internal, [_metrics(1.0)]
     )
 
 

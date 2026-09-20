@@ -166,6 +166,8 @@ def build_run_manifest(
         "attention_implementation",
         "ca_max_relative_age",
         "ca_controller_application",
+        "lstm_forget_gate",
+        "lstm_control_input",
         "positional_encoder",
         "n_layer_begin",
         "n_layer_end",
@@ -201,6 +203,7 @@ def build_run_manifest(
         "ca_delayed_percentage",
         "query_horizon_policy",
         "ca_query_loss_weight",
+        "ca_recall_repeats",
         "iterations",
         "scheduler",
         "final_div_factor",
@@ -229,11 +232,18 @@ def build_run_manifest(
         "ca_final_eval_pairs",
         "ca_repeat_diagnostic_max_repeats",
         "ca_repeat_diagnostic_horizons",
+        "dca_lstm_memory_evolution_repeats",
+        "dca_lstm_memory_query_repeats",
+        "dca_lstm_memory_recall_steps",
+        "dca_lstm_memory_examples",
+
+
     )
     checkpoint_fields = (
         "ca_best_pair",
         "ca_best_length",
         "ca_best_metric",
+        "ca_delayed_best_metric",
         "ca_extrapolation_best_metric",
         "ca_extrapolation_min_id_cell_accuracy",
         "ca_extrapolation_min_id_exact_sequence_accuracy",
@@ -995,6 +1005,18 @@ def _append_delayed_recall_summary(
         return
     for field, role in (
         (
+            "all_queries_pair_macro",
+            "delayed_recall_all_queries_pair_macro",
+        ),
+        (
+            "all_internal_consistency_pair_macro",
+            "delayed_recall_all_internal_pair_macro",
+        ),
+        (
+            "all_ground_truth_retrieval_pair_macro",
+            "delayed_recall_all_ground_truth_retrieval_pair_macro",
+        ),
+        (
             "nontrivial_queries_pair_macro",
             "delayed_recall_nontrivial_pair_macro",
         ),
@@ -1125,6 +1147,7 @@ def normalize_training_stats(
     canonical_checkpoints = (
         "best_id",
         "best_delayed_recall",
+        "best_internal_recall",
         "best_extrapolation_strict",
         "best_extrapolation_unconstrained",
     )

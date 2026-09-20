@@ -108,6 +108,15 @@ def get_args():
         default=None,
 
     )
+    parser.add_argument(
+    "--ca_recall_repeats",
+    type=positive_int,
+    default=1,
+    help=(
+        "Number of recurrent recall passes after the ordinary CA evolution "
+        "passes. Only the final recall pass is decoded for the delayed-query loss."
+    ),
+    )
 
     # Task shape.  Training length is separate from sequence_length because
     # sequence_length is the largest row the model can accept, while training
@@ -134,6 +143,66 @@ def get_args():
             "Manual attention remains separate from diagnostic collection."
         ),
     )
+    parser.add_argument(
+          "--lstm_forget_gate",
+          choices=("learned", "none"),
+          default="learned",
+          help=(
+              "LSTM-UT retention ablation. 'learned' uses a learned forget gate; "
+              "'none' retains the previous cell exactly before the additive write."
+          ),
+      )
+    parser.add_argument(
+        "--dca_lstm_memory_evolution_repeats",
+        type=positive_int,
+        nargs="*",
+        default=None,
+        metavar="REPEAT",
+        help=(
+            "Evolution repeats at which to save and decode the shared LSTM cell. "
+            "Providing this option enables the evaluation-only memory diagnostic."
+        ),
+    )
+    parser.add_argument(
+        "--dca_lstm_memory_query_repeats",
+        type=positive_int,
+        nargs="*",
+        default=None,
+        metavar="QUERY_REPEAT",
+        help=(
+            "Delayed-recall query repeats for which memory is inspected. "
+            "Defaults to every query repeat of --ca_best_pair."
+        ),
+    )
+    parser.add_argument(
+        "--dca_lstm_memory_recall_steps",
+        type=positive_int,
+        nargs="*",
+        default=None,
+        metavar="RECALL_STEP",
+        help=(
+            "Recall passes after which to save and decode the shared LSTM cell. "
+            "Indices are one-based and cannot exceed --ca_recall_repeats."
+        ),
+    )
+    parser.add_argument(
+        "--dca_lstm_memory_examples",
+        type=positive_int,
+        default=2,
+        help=(
+            "Number of fixed validation rows stored in each raw memory artifact."
+        ),
+    )
+
+    parser.add_argument(
+          "--lstm_control_input",
+          choices=("previous_and_proposed", "proposed"),
+          default="previous_and_proposed",
+          help=(
+              "Inputs used by the LSTM-UT forget, write, proposal, and hidden gates."
+          ),
+      )
+
     parser.add_argument(
         "--ca_train_pairs",
         type=ca_step_repeat_pair,
@@ -229,7 +298,7 @@ def get_args():
         default="cell_accuracy",
         help=(
             "Metric used to select best_delayed_recall.pt from the pair-balanced "
-            "nontrivial delayed queries."
+            "aggregate over all delayed queries, including current-state recall."
         ),
     )
     parser.add_argument(
@@ -594,6 +663,90 @@ def apply_ca_task_config(args, distributed_backend):
             args.ca_best_pair = max(args.ca_train_pairs)
         elif args.ca_best_pair not in args.ca_train_pairs:
             raise ValueError("--ca_best_pair must be included in --ca_train_pairs.")
+
+        
+
+        memory_diagnostic_requested = any(
+            value is not None
+            for value in (
+                args.dca_lstm_memory_evolution_repeats,
+                args.dca_lstm_memory_query_repeats,
+                args.dca_lstm_memory_recall_steps,
+            )
+        )
+
+        if memory_diagnostic_requested:
+            if args.model != "dca_lstm_ut":
+                raise ValueError(
+                    "LSTM memory diagnostics require --model dca_lstm_ut."
+                )
+
+            evolution_repeats = (
+                args.dca_lstm_memory_evolution_repeats or []
+            )
+            query_repeats = args.dca_lstm_memory_query_repeats
+            recall_steps = args.dca_lstm_memory_recall_steps or []
+
+            if not evolution_repeats and not recall_steps:
+                raise ValueError(
+                    "LSTM memory diagnostics require at least one evolution "
+                    "repeat or recall step."
+                )
+
+            if query_repeats is not None and not query_repeats:
+                raise ValueError(
+                    "--dca_lstm_memory_query_repeats cannot be empty when supplied."
+                )
+
+            for option_name, values in (
+                (
+                    "--dca_lstm_memory_evolution_repeats",
+                    evolution_repeats,
+                ),
+                (
+                    "--dca_lstm_memory_query_repeats",
+                    query_repeats or [],
+                ),
+                (
+                    "--dca_lstm_memory_recall_steps",
+                    recall_steps,
+                ),
+            ):
+                if len(values) != len(set(values)):
+                    raise ValueError(
+                        f"{option_name} cannot contain duplicate values."
+                    )
+
+            diagnostic_repeats = args.ca_best_pair[1]
+
+            if any(
+                repeat > diagnostic_repeats
+                for repeat in evolution_repeats
+            ):
+                raise ValueError(
+                    "--dca_lstm_memory_evolution_repeats cannot exceed the "
+                    f"best-pair repeat count ({diagnostic_repeats})."
+                )
+
+            if query_repeats is not None and any(
+                repeat > diagnostic_repeats
+                for repeat in query_repeats
+            ):
+                raise ValueError(
+                    "--dca_lstm_memory_query_repeats cannot exceed the "
+                    f"best-pair repeat count ({diagnostic_repeats})."
+                )
+
+            if any(
+                recall_step > args.ca_recall_repeats
+                for recall_step in recall_steps
+            ):
+                raise ValueError(
+                    "--dca_lstm_memory_recall_steps cannot exceed "
+                    f"--ca_recall_repeats={args.ca_recall_repeats}."
+                )
+
+
         if args.ca_final_external_steps:
             raise ValueError(
                 "--ca_final_external_steps is not yet defined for variable-horizon "
@@ -953,6 +1106,7 @@ def main(args):
                 "best_length": args.ca_best_length,
                 "best_metric": args.ca_best_metric,
                 "delayed_percentage": args.ca_delayed_percentage,
+                "recall_repeats" : args.ca_recall_repeats,
                 "query_horizon_policy": args.query_horizon_policy,
                 "max_relative_age": args.ca_max_relative_age,
                 "controller_application": args.ca_controller_application,

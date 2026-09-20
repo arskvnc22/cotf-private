@@ -17,6 +17,7 @@ from cellular_automaton.ca_analyze import (
     manifest_matches,
     parse_filter,
     summarize,
+    lstm_ut_configuration_fields
 )
 from cellular_automaton.ca_reporting import (
     build_run_manifest,
@@ -50,17 +51,22 @@ def write_delayed_run(
     loss,
     controller="persistent",
     delayed_percentage=75,
+    recall_repeats=1,
+    query_accuracies=None,
+    internal_query_accuracies=None,
+    model="dca_but",
 ):
-    run_dir = root / f"run_{number}__dca_but_{controller}"
+    run_dir = root / f"run_{number}__{model}_{controller}"
     args = sample_args(seed=seed, data_seed=data_seed)
     args.update(
         {
-            "model": "dca_but",
+            "model": model,
             "ca_controller_application": controller,
             "ca_max_relative_age": 3,
             "ca_delayed_percentage": delayed_percentage,
             "query_horizon_policy": "uniform",
             "ca_query_loss_weight": 2.0,
+            "ca_recall_repeats": recall_repeats,
             "ca_delayed_best_metric": "cell_accuracy",
             "ca_boundary": "periodic",
             "ca_bernoulli_p": 0.5,
@@ -88,11 +94,96 @@ def write_delayed_run(
     ]
     for location in delayed_locations:
         pair = location["delayed_recall"]["steps_3_repeats_3"]
-        pair["nontrivial_queries_macro"].update(replacement)
-        pair["queries"]["query_repeat_1"]["metrics"].update(replacement)
-        location["delayed_recall_summary"][
-            "nontrivial_queries_pair_macro"
-        ].update(replacement)
+        pair["nontrivial_queries_macro"] = {
+            **pair["nontrivial_queries_macro"],
+            **replacement,
+        }
+        query = pair["queries"]["query_repeat_1"]
+        agreement = 0.5
+        changed_fraction = 1.0 - agreement
+        requested_accuracy = cell_accuracy
+        changed_accuracy = cell_accuracy - 0.1
+        current_accuracy = (
+            requested_accuracy
+            + changed_fraction
+            - 2.0 * changed_fraction * changed_accuracy
+        )
+        query["metrics"] = {
+            **query["metrics"],
+            **replacement,
+            "cell_accuracy": requested_accuracy,
+        }
+        query["ground_truth_comparison_by_repeat"]["repeat_3"] = {
+            **query["ground_truth_comparison_by_repeat"]["repeat_3"],
+            "cell_accuracy": current_accuracy,
+        }
+        query["ground_truth_state_collision_by_repeat"]["repeat_3"] = {
+            **query["ground_truth_state_collision_by_repeat"]["repeat_3"],
+            "cell_agreement": agreement,
+        }
+        internal = query["internal_consistency"]
+        internal["decoded_requested_repeat"] = {
+            **internal["decoded_requested_repeat"],
+            "cell_accuracy": requested_accuracy,
+        }
+        internal["decoded_comparison_by_repeat"]["repeat_3"] = {
+            **internal["decoded_comparison_by_repeat"]["repeat_3"],
+            "cell_accuracy": current_accuracy,
+        }
+        internal["decoded_state_collision_by_repeat"]["repeat_3"] = {
+            **internal["decoded_state_collision_by_repeat"]["repeat_3"],
+            "cell_agreement": agreement,
+        }
+        pair["nontrivial_internal_consistency_macro"] = {
+            **pair["nontrivial_internal_consistency_macro"],
+            "decoded_requested_repeat_cell_accuracy": cell_accuracy,
+        }
+        summary = location["delayed_recall_summary"]
+        summary["nontrivial_queries_pair_macro"] = {
+            **summary["nontrivial_queries_pair_macro"],
+            **replacement,
+        }
+        summary["nontrivial_internal_consistency_pair_macro"] = {
+            **summary["nontrivial_internal_consistency_pair_macro"],
+            "decoded_requested_repeat_cell_accuracy": cell_accuracy,
+        }
+        if query_accuracies is not None:
+            if set(query_accuracies) != {1, 2, 3}:
+                raise ValueError("Test query accuracies must cover repeats 1, 2, 3.")
+            internal_accuracies = internal_query_accuracies or query_accuracies
+            if set(internal_accuracies) != {1, 2, 3}:
+                raise ValueError(
+                    "Test internal accuracies must cover repeats 1, 2, 3."
+                )
+            template = deepcopy(query)
+            pair["queries"] = {}
+            for query_repeat in (1, 2, 3):
+                query_entry = deepcopy(template)
+                query_entry["query_repeat"] = query_repeat
+                query_entry["recall_age"] = 3 - query_repeat
+                query_entry["metrics"]["cell_accuracy"] = query_accuracies[
+                    query_repeat
+                ]
+                query_entry["internal_consistency"][
+                    "decoded_requested_repeat"
+                ]["cell_accuracy"] = internal_accuracies[query_repeat]
+                pair["queries"][f"query_repeat_{query_repeat}"] = query_entry
+            nontrivial = [query_accuracies[1], query_accuracies[2]]
+            internal_nontrivial = [
+                internal_accuracies[1], internal_accuracies[2]
+            ]
+            pair["nontrivial_queries_macro"]["cell_accuracy"] = sum(
+                nontrivial
+            ) / len(nontrivial)
+            pair["nontrivial_internal_consistency_macro"][
+                "decoded_requested_repeat_cell_accuracy"
+            ] = sum(internal_nontrivial) / len(internal_nontrivial)
+            summary["nontrivial_queries_pair_macro"]["cell_accuracy"] = sum(
+                nontrivial
+            ) / len(nontrivial)
+            summary["nontrivial_internal_consistency_pair_macro"][
+                "decoded_requested_repeat_cell_accuracy"
+            ] = sum(internal_nontrivial) / len(internal_nontrivial)
     stats["checkpoint_analysis"]["best_delayed_recall"]["task_metrics"] = {
         "in_distribution": {
             "steps_3_repeats_3": {
@@ -244,6 +335,67 @@ def test_plot_series_streams_filtered_metrics_from_disk(tmp_path):
     ]
     assert retained_values == [pytest.approx(0.7)]
 
+
+def test_lstm_ut_ablation_fields_are_labeled_and_grouped(tmp_path):
+    variants = (
+        ("learned", "previous_and_proposed"),
+        ("learned", "proposed"),
+        ("none", "previous_and_proposed"),
+        ("none", "proposed"),
+    )
+    manifests = []
+
+    for index, (forget_gate, control_input) in enumerate(variants):
+        args = sample_args(seed=index, data_seed=11)
+        args.update(
+            {
+                "model": "lstm_ut_bidir",
+                "lstm_forget_gate": forget_gate,
+                "lstm_control_input": control_input,
+            }
+        )
+        manifest = build_run_manifest(
+            args,
+            tmp_path / f"run_{index}__lstm_ut_bidir",
+            tmp_path / "checkpoints",
+        )
+        manifests.append(manifest)
+
+        assert lstm_ut_configuration_fields(manifest) == (
+            forget_gate,
+            control_input,
+        )
+        label = configuration_label(manifest)
+        assert f"lstm-forget={forget_gate}" in label
+        assert f"lstm-control={control_input}" in label
+
+    configurations = {
+        json.dumps(
+            comparison_configuration(
+                manifest,
+                average_over=("seed", "data_seed"),
+            ),
+            sort_keys=True,
+        )
+        for manifest in manifests
+    }
+    assert len(configurations) == 4
+
+    assert manifest_matches(
+        manifests[3],
+        [
+            parse_filter('forget_gate="none"'),
+            parse_filter("control_input=proposed"),
+        ],
+    )
+
+    non_lstm = build_run_manifest(
+        sample_args(),
+        tmp_path / "run_non_lstm",
+        tmp_path / "checkpoints",
+    )
+    assert lstm_ut_configuration_fields(non_lstm) == (None, None)
+    assert "lstm-forget=" not in configuration_label(non_lstm)
 
 def test_cache_policy_labels_and_grouping_distinguish_intervention(tmp_path):
     full_args = sample_args(seed=1)
@@ -876,6 +1028,255 @@ def test_delayed_compare_aggregates_replicate_seeds(tmp_path):
     assert len(report["overall"]) == 1
     assert report["overall"][0]["n"] == 2
     assert report["overall"][0]["mean"] == pytest.approx(0.8)
+
+
+def test_recall_repeat_compare_reports_paired_age_and_internal_deltas(
+    tmp_path, capsys
+):
+    runs_root = tmp_path / "runs"
+    output_dir = tmp_path / "recall-repeat-comparison"
+    common = {"model": "dca_cotf_cache", "data_seed": 11}
+    write_delayed_run(
+        runs_root,
+        1,
+        seed=1,
+        cell_accuracy=0.0,
+        exact_accuracy=0.0,
+        loss=0.0,
+        recall_repeats=1,
+        query_accuracies={1: 0.6, 2: 0.7, 3: 0.8},
+        internal_query_accuracies={1: 0.5, 2: 0.6, 3: 0.7},
+        **common,
+    )
+    write_delayed_run(
+        runs_root,
+        2,
+        seed=2,
+        cell_accuracy=0.0,
+        exact_accuracy=0.0,
+        loss=0.0,
+        recall_repeats=1,
+        query_accuracies={1: 0.8, 2: 0.9, 3: 1.0},
+        internal_query_accuracies={1: 0.7, 2: 0.8, 3: 0.9},
+        **common,
+    )
+    write_delayed_run(
+        runs_root,
+        3,
+        seed=1,
+        cell_accuracy=0.0,
+        exact_accuracy=0.0,
+        loss=0.0,
+        recall_repeats=2,
+        query_accuracies={1: 0.7, 2: 0.9, 3: 0.9},
+        internal_query_accuracies={1: 0.6, 2: 0.8, 3: 0.8},
+        **common,
+    )
+    write_delayed_run(
+        runs_root,
+        4,
+        seed=2,
+        cell_accuracy=0.0,
+        exact_accuracy=0.0,
+        loss=0.0,
+        recall_repeats=2,
+        query_accuracies={1: 0.9, 2: 1.0, 3: 1.0},
+        internal_query_accuracies={1: 0.8, 2: 0.9, 3: 0.95},
+        **common,
+    )
+
+    assert main(
+        [
+            "recall-repeat-compare",
+            "--runs",
+            str(runs_root),
+            "--horizon",
+            "3",
+            "--output-dir",
+            str(output_dir),
+        ]
+    ) == 0
+
+    output = capsys.readouterr().out
+    assert "GT mean delta" in output
+    assert "internal mean delta" in output
+    assert "Checkpoint steps: one-pass=[50], two-pass=[50]" in output
+    assert "Deltas are two-pass minus one-pass" in output
+    assert "overall excludes recall age zero" in output
+
+    report = json.loads(
+        (output_dir / "recall_repeat_comparison.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert report["recall_repeat_counts"] == [1, 2]
+    assert report["one_repeat_checkpoint_steps"] == [50]
+    assert report["two_repeat_checkpoint_steps"] == [50]
+    assert report["paired_seeds"] == [
+        {"model_seed": 1, "data_seed": 11},
+        {"model_seed": 2, "data_seed": 11},
+    ]
+    by_age = {
+        row["recall_age"]: row
+        for row in report["rows"]
+        if row["scope"] == "recall_age"
+    }
+    assert by_age[0]["query_repeat"] == 3
+    assert by_age[2]["query_repeat"] == 1
+    assert by_age[1]["ground_truth_one_repeat_mean"] == pytest.approx(0.8)
+    assert by_age[1]["ground_truth_two_repeat_mean"] == pytest.approx(0.95)
+    assert by_age[1][
+        "ground_truth_delta_two_minus_one_mean"
+    ] == pytest.approx(0.15)
+    assert by_age[0]["internal_one_repeat_mean"] == pytest.approx(0.8)
+    assert by_age[0]["internal_two_repeat_mean"] == pytest.approx(0.875)
+    assert by_age[0][
+        "internal_delta_two_minus_one_mean"
+    ] == pytest.approx(0.075)
+
+    overall = next(
+        row for row in report["rows"] if row["scope"] == "overall_nontrivial"
+    )
+    assert overall["ground_truth_one_repeat_mean"] == pytest.approx(0.75)
+    assert overall["ground_truth_two_repeat_mean"] == pytest.approx(0.875)
+    assert overall[
+        "ground_truth_delta_two_minus_one_mean"
+    ] == pytest.approx(0.125)
+    assert overall["internal_one_repeat_mean"] == pytest.approx(0.65)
+    assert overall["internal_two_repeat_mean"] == pytest.approx(0.775)
+    assert overall["internal_delta_two_minus_one_mean"] == pytest.approx(0.125)
+    assert len(overall["paired_values"]) == 4
+    assert (output_dir / "recall_repeat_comparison.csv").is_file()
+    assert (output_dir / "recall_repeat_paired_values.csv").is_file()
+    assert (output_dir / "analysis_manifest.json").is_file()
+
+
+def test_recall_repeat_compare_requires_paired_seed_coverage(tmp_path, capsys):
+    runs_root = tmp_path / "runs"
+    common = {
+        "data_seed": 11,
+        "cell_accuracy": 0.7,
+        "exact_accuracy": 0.4,
+        "loss": 0.3,
+        "model": "dca_cotf_cache",
+        "query_accuracies": {1: 0.6, 2: 0.7, 3: 0.8},
+        "internal_query_accuracies": {1: 0.5, 2: 0.6, 3: 0.7},
+    }
+    write_delayed_run(
+        runs_root, 1, seed=1, recall_repeats=1, **common
+    )
+    write_delayed_run(
+        runs_root, 2, seed=2, recall_repeats=1, **common
+    )
+    write_delayed_run(
+        runs_root, 3, seed=1, recall_repeats=2, **common
+    )
+
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "recall-repeat-compare",
+                "--runs",
+                str(runs_root),
+                "--horizon",
+                "3",
+            ]
+        )
+    assert error.value.code == 2
+    assert "identical paired" in capsys.readouterr().err
+
+
+def test_recall_repeat_compare_rejects_other_configuration_differences(
+    tmp_path, capsys
+):
+    runs_root = tmp_path / "runs"
+    common = {
+        "seed": 1,
+        "data_seed": 11,
+        "cell_accuracy": 0.7,
+        "exact_accuracy": 0.4,
+        "loss": 0.3,
+        "model": "dca_cotf_cache",
+        "query_accuracies": {1: 0.6, 2: 0.7, 3: 0.8},
+        "internal_query_accuracies": {1: 0.5, 2: 0.6, 3: 0.7},
+    }
+    write_delayed_run(
+        runs_root,
+        1,
+        recall_repeats=1,
+        controller="persistent",
+        **common,
+    )
+    write_delayed_run(
+        runs_root,
+        2,
+        recall_repeats=2,
+        controller="subtract",
+        **common,
+    )
+
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "recall-repeat-compare",
+                "--runs",
+                str(runs_root),
+                "--horizon",
+                "3",
+            ]
+        )
+    assert error.value.code == 2
+    assert "exactly one scientific configuration" in capsys.readouterr().err
+
+
+def test_changed_cell_accuracy_excludes_cells_matching_current_state():
+    assert ca_analyze._changed_cell_accuracy(0.8, 0.6, 0.5) == pytest.approx(
+        0.7
+    )
+    assert ca_analyze._changed_cell_accuracy(1.0, 1.0, 1.0) is None
+
+
+@pytest.mark.parametrize(
+    ("ordinary_metric", "changed_metric"),
+    (
+        ("cell_accuracy", "changed_cell_accuracy"),
+        (
+            "internal_cell_accuracy",
+            "internal_changed_cell_accuracy",
+        ),
+    ),
+)
+def test_changed_cell_metrics_do_not_replace_ordinary_accuracy(
+    tmp_path, ordinary_metric, changed_metric
+):
+    runs_root = tmp_path / "runs"
+    write_delayed_run(
+        runs_root,
+        1,
+        seed=1,
+        data_seed=11,
+        cell_accuracy=0.8,
+        exact_accuracy=0.4,
+        loss=0.3,
+    )
+    runs = discover_runs(runs_root, load_metrics=False)
+    args = Namespace(
+        metrics=[ordinary_metric, changed_metric],
+        run_id=None,
+        split="final_test",
+        checkpoint="best_delayed_recall",
+        length=64,
+        average_over="seed,data_seed",
+        strict_match=False,
+    )
+
+    _selected, _specs, _raw, report = ca_analyze._build_delayed_report(
+        args, runs
+    )
+
+    overall = {row["metric"]: row["mean"] for row in report["overall"]}
+    assert overall[ordinary_metric] == pytest.approx(0.8)
+    assert overall[changed_metric] == pytest.approx(0.7)
 
 
 def test_delayed_compare_strict_protocol_match_rejects_mismatch(

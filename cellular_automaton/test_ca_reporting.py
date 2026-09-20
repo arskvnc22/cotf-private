@@ -41,6 +41,8 @@ def sample_args(seed=1, data_seed=11):
         "ca_extrapolation_val_pairs": [[3, 3]],
         "ca_final_eval_pairs": [[3, 3], [5, 5]],
         "ca_best_metric": "exact_sequence_accuracy",
+        "ca_delayed_best_metric": "cell_accuracy",
+        "ca_recall_repeats": 2,
         "ca_best_length": 64,
         "ca_extrapolation_best_metric": "cell_accuracy",
         "seed": seed,
@@ -118,6 +120,11 @@ def sample_stats():
         "requested_repeat_positive_margin_rate": 0.75,
         "total_sequences": 4,
     }
+    internal_macro = {
+        **retrieval,
+        "decoded_requested_repeat_cell_accuracy": 0.8,
+        "decoded_requested_repeat_exact_sequence_accuracy": 0.6,
+    }
     collision = {
         "cell_agreement": 0.4,
         "exact_row_collision_rate": 0.1,
@@ -172,14 +179,17 @@ def sample_stats():
         "queries": {"query_repeat_1": delayed_query},
         "all_queries_macro": metric,
         "nontrivial_queries_macro": metric,
-        "all_queries_internal_consistency_macro": retrieval,
-        "nontrivial_internal_consistency_macro": retrieval,
+        "all_queries_internal_consistency_macro": internal_macro,
+        "nontrivial_internal_consistency_macro": internal_macro,
         "all_queries_ground_truth_retrieval_macro": retrieval,
         "nontrivial_ground_truth_retrieval_macro": retrieval,
     }
     delayed_summary = {
+        "all_queries_pair_macro": metric,
+        "all_internal_consistency_pair_macro": internal_macro,
+        "all_ground_truth_retrieval_pair_macro": retrieval,
         "nontrivial_queries_pair_macro": metric,
-        "nontrivial_internal_consistency_pair_macro": retrieval,
+        "nontrivial_internal_consistency_pair_macro": internal_macro,
         "nontrivial_ground_truth_retrieval_pair_macro": retrieval,
     }
     return {
@@ -310,6 +320,14 @@ def sample_stats():
                 },
                 "delayed_recall_summary": delayed_summary,
             },
+            "best_internal_recall": {
+                "checkpoint": {"step": 50, "length": 64},
+                "task_metrics": {},
+                "delayed_recall": {
+                    "steps_3_repeats_3": delayed_pair,
+                },
+                "delayed_recall_summary": delayed_summary,
+            },
         },
     }
 
@@ -333,6 +351,10 @@ def test_manifest_preserves_arbitrary_training_pairs(tmp_path):
     }
     assert manifest["seeds"]["seed"] == 1
     assert manifest["seeds"]["data_seed"] == 11
+    assert manifest["training"]["ca_recall_repeats"] == 2
+    assert manifest["checkpoint_selection"]["ca_delayed_best_metric"] == (
+        "cell_accuracy"
+    )
 
 
 def test_manifest_records_recent_cache_policy(tmp_path):
@@ -385,6 +407,8 @@ def test_normalization_exports_scalar_long_form_records(tmp_path):
     assert "delayed_recall_cosine_retrieval" in roles
     assert "delayed_recall_ground_truth_collision" in roles
     assert "delayed_recall_nontrivial_pair_macro" in roles
+    assert "delayed_recall_all_queries_pair_macro" in roles
+    assert "delayed_recall_all_internal_pair_macro" in roles
     assert not any(record["metric"] == "position_accuracy" for record in records)
 
     external = next(
@@ -446,6 +470,16 @@ def test_normalization_exports_scalar_long_form_records(tmp_path):
     )
     assert final_cosine_rank["data_split"] == "final_test"
     assert final_cosine_rank["value"] == 1.25
+
+    final_internal_cell = next(
+        record
+        for record in records
+        if record["evaluation_role"] == "delayed_recall_all_internal_pair_macro"
+        and record["metric"] == "decoded_requested_repeat_cell_accuracy"
+        and record["checkpoint_type"] == "best_internal_recall"
+    )
+    assert final_internal_cell["data_split"] == "final_test"
+    assert final_internal_cell["value"] == 0.8
 
 
 def test_normalization_infers_policy_for_historical_manifest(tmp_path):

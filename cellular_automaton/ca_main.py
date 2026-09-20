@@ -135,6 +135,24 @@ def get_args():
         ),
     )
     parser.add_argument(
+        "--lstm_forget_gate",
+        choices=("learned", "none"),
+        default="learned",
+        help=(
+            "LSTM-UT retention ablation. 'learned' uses a learned forget gate; "
+            "'none' retains the previous cell exactly before the additive write."
+        ),
+    )
+    parser.add_argument(
+        "--lstm_control_input",
+        choices=("previous_and_proposed", "proposed"),
+        default="previous_and_proposed",
+        help=(
+            "Inputs used by the LSTM-UT forget, write, proposal, and hidden gates."
+        ),
+    )
+
+    parser.add_argument(
         "--ca_train_pairs",
         type=ca_step_repeat_pair,
         nargs="+",

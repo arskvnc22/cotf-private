@@ -3,6 +3,7 @@
 import math
 import inspect
 from contextlib import nullcontext
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -342,6 +343,258 @@ def _decode_dca_repeat_states(model, repeat_states, num_repeats):
         for repeat in range(1, num_repeats + 1)
     }
 
+def _probe_lstm_memory_snapshot(model, cell, reference):
+    """
+    Decode one LSTM cell snapshot with a fixed, parameter-free probe.
+
+    The LSTM block exposes tanh(cell) to the hidden stream, so the closest
+    existing decoder is lm_head(ln_f(tanh(cell))). This head was not trained
+    directly on isolated cell states; its output is therefore a diagnostic
+    probe rather than a guaranteed semantic decoding.
+    """
+    if cell.ndim != 3:
+        raise ValueError(
+            "LSTM memory diagnostics expect [batch, cells, embedding] cells."
+        )
+    if reference.shape != cell.shape[:2]:
+        raise ValueError(
+            "The memory reference must align with the batch and cell axes."
+        )
+
+    transformer = getattr(model, "transformer", None)
+    lm_head = getattr(model, "lm_head", None)
+    if transformer is None or lm_head is None:
+        raise TypeError(
+            "LSTM memory decoding requires transformer.ln_f and lm_head."
+        )
+
+    cell_fp32 = cell.detach().float()
+    exposed_memory = torch.tanh(cell_fp32)
+
+    # Model parameters remain FP32 in the current mixed-precision setup.
+    probe_input = exposed_memory.to(dtype=lm_head.weight.dtype)
+    decoded_logits = lm_head(transformer.ln_f(probe_input)).float()
+    decoded_predictions = decoded_logits.argmax(dim=-1)
+    decoded_probabilities = decoded_logits.softmax(dim=-1)
+
+    correct = decoded_predictions.eq(reference)
+    batch_size = reference.shape[0]
+
+    summary = {
+        "cell_mean": float(cell_fp32.mean().item()),
+        "cell_std": float(
+            cell_fp32.std(unbiased=False).item()
+        ),
+        "cell_rms": float(
+            cell_fp32.square().mean().sqrt().item()
+        ),
+        "cell_abs_max": float(cell_fp32.abs().max().item()),
+        "exposed_saturation_fraction": float(
+            exposed_memory.abs().gt(0.99).float().mean().item()
+        ),
+        "decoded_cell_accuracy": float(
+            correct.float().mean().item()
+        ),
+        "decoded_exact_sequence_accuracy": float(
+            correct.all(dim=1).float().mean().item()
+        ),
+        "decoded_mean_confidence": float(
+            decoded_probabilities.max(dim=-1).values.mean().item()
+        ),
+        "examples": [
+            {
+                "decoded": _bit_string(decoded_predictions[index]),
+                "reference": _bit_string(reference[index]),
+            }
+            for index in range(batch_size)
+        ],
+    }
+
+    artifact = {
+        "cell": cell_fp32.cpu(),
+        "exposed_memory": exposed_memory.cpu(),
+        "decoded_logits": decoded_logits.detach().cpu(),
+        "decoded_predictions": decoded_predictions.detach().cpu(),
+        "reference": reference.detach().cpu(),
+    }
+
+    return summary, artifact
+
+
+@torch.no_grad()
+def save_lstm_memory_diagnostics(
+    forward_context,
+    dataloader,
+    device,
+    *,
+    num_repeats,
+    num_recall_repeats,
+    evolution_repeats,
+    recall_steps,
+    num_examples,
+    artifact_path,
+    query_repeats=None,
+    ctx=None,
+):
+    """
+    Save raw shared-cell snapshots and return a JSON-compatible summary.
+
+    Only the first fixed validation batch and the requested number of examples
+    are retained. Evolution snapshots are stored once because they are
+    independent of the subsequently requested recall age.
+    """
+    evolution_repeats = tuple(evolution_repeats)
+    recall_steps = tuple(recall_steps)
+
+    if not evolution_repeats and not recall_steps:
+        raise ValueError(
+            "At least one evolution repeat or recall step is required."
+        )
+    if num_examples <= 0:
+        raise ValueError("num_examples must be positive.")
+
+    if query_repeats is None:
+        query_repeats = tuple(range(1, num_repeats + 1))
+    else:
+        query_repeats = tuple(query_repeats)
+
+    model = forward_context.model
+    was_training = model.training
+    model.eval()
+    ctx = ctx or nullcontext()
+
+    try:
+        try:
+            batch = next(iter(dataloader))
+        except StopIteration as error:
+            raise ValueError(
+                "LSTM memory diagnostics received an empty dataloader."
+            ) from error
+
+        inputs = batch["input_id"][:num_examples].to(
+            device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
+
+        true_states_by_repeat = {}
+        state = inputs
+        for repeat in range(1, num_repeats + 1):
+            state = rule30(state)
+            true_states_by_repeat[repeat] = state
+
+        artifact = {
+            "schema_version": 1,
+            "probe": "lm_head(ln_f(tanh(cell)))",
+            "num_repeats": int(num_repeats),
+            "num_recall_repeats": int(num_recall_repeats),
+            "input_ids": inputs.detach().cpu(),
+            "true_states_by_repeat": {
+                f"repeat_{repeat}": state.detach().cpu()
+                for repeat, state in true_states_by_repeat.items()
+            },
+            "evolution": {},
+            "recall_by_query": {},
+        }
+        summary = {
+            "probe": "lm_head(ln_f(tanh(cell)))",
+            "num_examples": int(inputs.shape[0]),
+            "num_repeats": int(num_repeats),
+            "num_recall_repeats": int(num_recall_repeats),
+            "evolution": {},
+            "recall_by_query": {},
+        }
+
+        for query_index, query_repeat in enumerate(query_repeats):
+            recall_age = num_repeats - query_repeat
+
+            with ctx:
+                _, _, outputs = _forward_all_cells(
+                    forward_context,
+                    inputs,
+                    num_repeats=num_repeats,
+                    delayed_recall=True,
+                    recall_age=recall_age,
+                    num_recall_repeats=num_recall_repeats,
+                    return_outputs=True,
+                    return_memory_states=True,
+                    memory_evolution_repeats=evolution_repeats,
+                    memory_recall_steps=recall_steps,
+                )
+
+            memory_states = outputs.get("memory_states")
+            if not isinstance(memory_states, dict):
+                raise KeyError(
+                    "DCA LSTM output is missing memory_states."
+                )
+
+            # Evolution is deterministic and independent of the later query.
+            # Store it once rather than duplicating it for every recall age.
+            if query_index == 0:
+                for repeat in evolution_repeats:
+                    cell = memory_states["evolution"].get(repeat)
+                    if cell is None:
+                        raise KeyError(
+                            f"Missing evolution memory snapshot {repeat}."
+                        )
+
+                    snapshot_summary, snapshot_artifact = (
+                        _probe_lstm_memory_snapshot(
+                            model,
+                            cell,
+                            true_states_by_repeat[repeat],
+                        )
+                    )
+                    key = f"repeat_{repeat}"
+                    summary["evolution"][key] = snapshot_summary
+                    artifact["evolution"][key] = snapshot_artifact
+
+            query_key = f"query_repeat_{query_repeat}"
+            target = true_states_by_repeat[query_repeat]
+
+            summary_query = {
+                "query_repeat": int(query_repeat),
+                "recall_age": int(recall_age),
+                "steps": {},
+            }
+            artifact_query = {
+                "query_repeat": int(query_repeat),
+                "recall_age": int(recall_age),
+                "target": target.detach().cpu(),
+                "steps": {},
+            }
+
+            for recall_step in recall_steps:
+                cell = memory_states["recall"].get(recall_step)
+                if cell is None:
+                    raise KeyError(
+                        f"Missing recall memory snapshot {recall_step}."
+                    )
+
+                snapshot_summary, snapshot_artifact = (
+                    _probe_lstm_memory_snapshot(
+                        model,
+                        cell,
+                        target,
+                    )
+                )
+                step_key = f"recall_step_{recall_step}"
+                summary_query["steps"][step_key] = snapshot_summary
+                artifact_query["steps"][step_key] = snapshot_artifact
+
+            summary["recall_by_query"][query_key] = summary_query
+            artifact["recall_by_query"][query_key] = artifact_query
+
+    finally:
+        if was_training:
+            model.train()
+
+    artifact_path = Path(artifact_path)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(artifact, artifact_path)
+
+    summary["artifact_path"] = str(artifact_path)
+    return summary
 
 def _new_ranking_accumulator():
     return {
@@ -510,6 +763,11 @@ def _forward_all_cells(
     return_outputs=False,
     intervention_source_depth=None,
     intervention_input_ids=None,
+    num_recall_repeats=1,
+    return_memory_states=False,
+    memory_evolution_repeats=None,
+    memory_recall_steps=None,
+
 ):
     forward_kwargs = {
         "get_logits": True,
@@ -524,9 +782,13 @@ def _forward_all_cells(
             raise ValueError(
                 "recall_age is required for delayed recall evaluation."
             )
+        if num_recall_repeats <= 0:
+            raise ValueError("num_recall_repeats must be positive.")
 
         forward_kwargs["delayed_recall"] = True
         forward_kwargs["recall_age"] = recall_age
+        forward_kwargs["num_recall_repeats"] = num_recall_repeats
+
     elif recall_age is not None:
         raise ValueError(
             "recall_age must be None when delayed_recall=False."
@@ -534,6 +796,19 @@ def _forward_all_cells(
 
     if return_repeat_states:
         forward_kwargs["return_repeat_states"] = True
+    if return_memory_states:
+        forward_kwargs["return_memory_states"] = True
+        forward_kwargs["memory_evolution_repeats"] = (
+            memory_evolution_repeats
+        )
+        forward_kwargs["memory_recall_steps"] = memory_recall_steps
+    elif (
+        memory_evolution_repeats is not None
+        or memory_recall_steps is not None
+    ):
+        raise ValueError(
+            "Memory snapshot selections require return_memory_states=True."
+        )
 
     if intervention_source_depth is not None or intervention_input_ids is not None:
         forward_kwargs["intervention_source_depth"] = intervention_source_depth
@@ -607,6 +882,8 @@ def evaluate_delayed_recall_query(
     *,
     num_repeats,
     query_repeat,
+    num_recall_repeats=1,
+
     max_batches=None,
     num_examples=2,
     ctx=None,
@@ -697,6 +974,7 @@ def evaluate_delayed_recall_query(
                     num_repeats=num_repeats,
                     delayed_recall=True,
                     recall_age=recall_age,
+                    num_recall_repeats=num_recall_repeats,
                     return_repeat_states=True,
                     return_outputs=True,
                 )
@@ -1016,6 +1294,7 @@ def evaluate_delayed_recall_query(
     return {
         "num_repeats": num_repeats,
         "query_repeat": query_repeat,
+        "num_recall_repeats": num_recall_repeats,
         "recall_age": recall_age,
         "is_no_op": query_repeat == num_repeats,
         "metrics": metrics,
@@ -1158,50 +1437,66 @@ def _macro_ground_truth_retrieval(query_results):
     }
 
 
-def summarize_delayed_recall_pairs(pair_results):
-    """Pair-balanced summary used for delayed-recall reporting and selection."""
-    eligible_pairs = [
-        result
-        for result in pair_results.values()
-        if result["nontrivial_queries_macro"] is not None
+def _pair_balanced_macro(pair_results, field):
+    """Average one per-pair metric mapping with equal weight per pair."""
+    metric_mappings = [
+        result[field]
+        for result in pair_results
+        if result.get(field) is not None
     ]
-    if not eligible_pairs:
-        raise ValueError(
-            "Delayed-recall selection requires at least one pair with more "
-            "than one repeat."
-        )
+    if not metric_mappings:
+        return None
 
-    metric_names = tuple(eligible_pairs[0]["nontrivial_queries_macro"])
-    pair_macro = {
-        name: sum(
-            result["nontrivial_queries_macro"][name]
-            for result in eligible_pairs
-        )
-        / len(eligible_pairs)
+    # Single-repeat pairs do not define every retrieval margin/rank field.
+    # Retain only metrics defined for every included pair so the all-query
+    # summary can include the 1:1 pair without inventing missing values.
+    metric_names = tuple(
+        name
+        for name in metric_mappings[0]
+        if all(name in metrics for metrics in metric_mappings)
+    )
+    return {
+        name: sum(metrics[name] for metrics in metric_mappings)
+        / len(metric_mappings)
         for name in metric_names
     }
-    internal_names = tuple(
-        eligible_pairs[0]["nontrivial_internal_consistency_macro"]
+
+
+def summarize_delayed_recall_pairs(pair_results):
+    """Pair-balanced summary used for delayed-recall reporting and selection."""
+    all_pairs = list(pair_results.values())
+    if not all_pairs:
+        raise ValueError("Delayed-recall selection requires at least one pair.")
+
+    eligible_pairs = [
+        result
+        for result in all_pairs
+        if result["nontrivial_queries_macro"] is not None
+    ]
+
+    all_queries_pair_macro = _pair_balanced_macro(
+        all_pairs, "all_queries_macro"
     )
-    internal_pair_macro = {
-        name: sum(
-            result["nontrivial_internal_consistency_macro"][name]
-            for result in eligible_pairs
-        )
-        / len(eligible_pairs)
-        for name in internal_names
-    }
-    ground_truth_names = tuple(
-        eligible_pairs[0]["nontrivial_ground_truth_retrieval_macro"]
+    all_internal_pair_macro = _pair_balanced_macro(
+        all_pairs, "all_queries_internal_consistency_macro"
     )
-    ground_truth_pair_macro = {
-        name: sum(
-            result["nontrivial_ground_truth_retrieval_macro"][name]
-            for result in eligible_pairs
-        )
-        / len(eligible_pairs)
-        for name in ground_truth_names
-    }
+    all_ground_truth_pair_macro = _pair_balanced_macro(
+        all_pairs, "all_queries_ground_truth_retrieval_macro"
+    )
+    pair_macro = _pair_balanced_macro(
+        eligible_pairs, "nontrivial_queries_macro"
+    )
+    internal_pair_macro = _pair_balanced_macro(
+        eligible_pairs, "nontrivial_internal_consistency_macro"
+    )
+    ground_truth_pair_macro = _pair_balanced_macro(
+        eligible_pairs, "nontrivial_ground_truth_retrieval_macro"
+    )
+    all_queries = [
+        query
+        for result in all_pairs
+        for query in result["queries"].values()
+    ]
     nontrivial_queries = [
         query
         for result in eligible_pairs
@@ -1209,23 +1504,48 @@ def summarize_delayed_recall_pairs(pair_results):
         if not query["is_no_op"]
     ]
     worst_query = min(
-        nontrivial_queries,
+        all_queries,
         key=lambda result: result["metrics"]["cell_accuracy"],
     )
+    worst_nontrivial_query = (
+        min(
+            nontrivial_queries,
+            key=lambda result: result["metrics"]["cell_accuracy"],
+        )
+        if nontrivial_queries
+        else None
+    )
     return {
+        "pairs": len(all_pairs),
+        "all_queries": len(all_queries),
         "eligible_pairs": len(eligible_pairs),
         "nontrivial_queries": len(nontrivial_queries),
+        "all_queries_pair_macro": all_queries_pair_macro,
+        "all_internal_consistency_pair_macro": all_internal_pair_macro,
+        "all_ground_truth_retrieval_pair_macro": (
+            all_ground_truth_pair_macro
+        ),
         "nontrivial_queries_pair_macro": pair_macro,
         "nontrivial_internal_consistency_pair_macro": internal_pair_macro,
         "nontrivial_ground_truth_retrieval_pair_macro": (
             ground_truth_pair_macro
         ),
-        "worst_nontrivial_query": {
+        "worst_query": {
             "num_repeats": worst_query["num_repeats"],
             "query_repeat": worst_query["query_repeat"],
             "recall_age": worst_query["recall_age"],
             "metrics": worst_query["metrics"],
         },
+        "worst_nontrivial_query": (
+            {
+                "num_repeats": worst_nontrivial_query["num_repeats"],
+                "query_repeat": worst_nontrivial_query["query_repeat"],
+                "recall_age": worst_nontrivial_query["recall_age"],
+                "metrics": worst_nontrivial_query["metrics"],
+            }
+            if worst_nontrivial_query is not None
+            else None
+        ),
     }
 
 def evaluate_delayed_recall_pairs(
@@ -1235,6 +1555,7 @@ def evaluate_delayed_recall_pairs(
     *,
     pairs,
     max_batches=None,
+    num_recall_repeats=1,
     num_examples=2,
     ctx=None,
 ):
@@ -1247,6 +1568,7 @@ def evaluate_delayed_recall_pairs(
                 ca_steps=ca_steps,
                 num_repeats=num_repeats,
                 max_batches=max_batches,
+                num_recall_repeats=num_recall_repeats,
                 num_examples=num_examples,
                 ctx=ctx,
             )
@@ -1260,6 +1582,7 @@ def evaluate_delayed_recall_pair(
     ca_steps,
     num_repeats,
     max_batches=None,
+    num_recall_repeats=1,
     num_examples=2,
     ctx=None,
 ):
@@ -1278,6 +1601,7 @@ def evaluate_delayed_recall_pair(
             device,
             num_repeats=num_repeats,
             query_repeat=query_repeat,
+            num_recall_repeats=num_recall_repeats,
             max_batches=max_batches,
             num_examples=num_examples,
             ctx=ctx,

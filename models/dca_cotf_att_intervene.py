@@ -23,6 +23,21 @@ def print_deb(string):
     if debug:
         print(string)
 
+RECALL_CACHE_INTERVENTIONS = frozenset(
+    {
+        "target-value-corruption",
+        "target-repeat-only",
+        "target-repeat-masked",
+    }
+)
+
+RECALL_ATTENTION_MASK_INTERVENTIONS = frozenset(
+    {
+        "target-repeat-only",
+        "target-repeat-masked",
+    }
+)
+
 class InPlaceSetSlice(torch.autograd.Function):
     @staticmethod
     def forward(ctx, full_tensor, last_slice, x_val, dim):
@@ -102,6 +117,83 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         self.register_buffer("bias", bias.view(1, 1, config.sequence_length, config.sequence_length))
 
         self.drop_cache()
+
+
+    @staticmethod
+    def apply_recall_cache_intervention_mask(
+        attention_logits,
+        *,
+        intervention,
+        target_repeat,
+        evolution_repeats,
+        recall_index,
+        tokens_per_repeat,
+    ):
+        """Apply an explicit repeat-block mask before recall softmax."""
+        if intervention not in RECALL_ATTENTION_MASK_INTERVENTIONS:
+            raise ValueError(
+                f"Unsupported recall attention intervention: {intervention!r}."
+            )
+
+        if attention_logits.ndim != 4:
+            raise RuntimeError(
+                "Recall masking expects attention logits with shape [B, H, Q, K]."
+            )
+
+        key_tokens = int(attention_logits.shape[-1])
+        tokens_per_repeat = int(tokens_per_repeat)
+
+        if key_tokens % tokens_per_repeat != 0:
+            raise RuntimeError(
+                "Attention keys do not contain whole repeat blocks."
+            )
+
+        cached_repeats = key_tokens // tokens_per_repeat
+        expected_cached_repeats = int(evolution_repeats) + int(recall_index)
+
+        if cached_repeats != expected_cached_repeats:
+            raise RuntimeError(
+                "Unexpected recall cache depth: "
+                f"expected {expected_cached_repeats} blocks, "
+                f"found {cached_repeats}."
+            )
+
+        target_start = (int(target_repeat) - 1) * tokens_per_repeat
+        target_end = target_start + tokens_per_repeat
+        evolution_token_end = int(evolution_repeats) * tokens_per_repeat
+
+        if target_start < 0 or target_end > evolution_token_end:
+            raise RuntimeError(
+                "The requested target block is outside the evolution cache."
+            )
+
+        masked_keys = torch.zeros(
+            key_tokens,
+            dtype=torch.bool,
+            device=attention_logits.device,
+        )
+
+        if intervention == "target-repeat-only":
+            # Hide all evolution blocks, then expose the requested one.
+            # Recall-phase blocks, including the current block, remain visible.
+            masked_keys[:evolution_token_end] = True
+            masked_keys[target_start:target_end] = False
+
+        elif intervention == "target-repeat-masked":
+            # Hide only the requested evolution block.
+            masked_keys[target_start:target_end] = True
+
+        intervened_logits = attention_logits.masked_fill(
+            masked_keys.view(1, 1, 1, -1),
+            float("-inf"),
+        )
+
+        if not torch.isfinite(intervened_logits).any(dim=-1).all():
+            raise RuntimeError(
+                "Recall intervention left at least one query with no visible keys."
+            )
+
+        return intervened_logits
     @staticmethod
     def _summarize_attention(
         attention_logits,
@@ -532,7 +624,66 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         return diagnostics
     def init_cache(self, expected_total_length):
         self._lazy_init_cache_length = expected_total_length
+    @torch.no_grad()
+    def permute_cached_target_values(
+        self,
+        *,
+        target_repeat,
+        tokens_per_repeat,
+        permutation_offset,
+    ):
+        """Replace one cached repeat's values with another batch example's values."""
+        if not isinstance(self.all_values, tuple) or len(self.all_values) != 2:
+            raise RuntimeError(
+                "Unexpected CoTFormer value-cache representation."
+            )
 
+        full_values, populated_values = self.all_values
+        if populated_values is None:
+            raise RuntimeError(
+                "Value cache is empty before the recall intervention."
+            )
+
+        batch_size = int(full_values.shape[0])
+        if batch_size < 2:
+            raise ValueError(
+                "Target-value corruption requires batches containing "
+                "at least two examples."
+            )
+
+        tokens_per_repeat = int(tokens_per_repeat)
+        target_repeat = int(target_repeat)
+
+        target_start = (target_repeat - 1) * tokens_per_repeat
+        target_end = target_start + tokens_per_repeat
+
+        if target_start < 0 or target_end > populated_values.shape[2]:
+            raise RuntimeError(
+                "The requested evolution block has not been populated."
+            )
+
+        offset = int(permutation_offset) % batch_size
+        if offset == 0:
+            offset = 1
+
+        permutation = torch.roll(
+            torch.arange(batch_size, device=full_values.device),
+            shifts=offset,
+        )
+
+        replacement = full_values[
+            :, :, target_start:target_end, :
+        ].index_select(0, permutation).clone()
+
+        full_values[:, :, target_start:target_end, :] = replacement
+
+        return {
+            "batch_size": batch_size,
+            "permutation_offset": offset,
+            "target_cache_block_zero_based": target_repeat - 1,
+            "target_token_start": target_start,
+            "target_token_end_exclusive": target_end,
+        }
     def drop_cache(self):
         self.all_keys = None
         self.all_values = None
@@ -540,7 +691,12 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
         self._lazy_init_cache_length = None
         
 
-    def forward(self, x, pos_emb_closure, cache_context, start_index, indices,collect_attention_diagnostics=False, attention_diagnostics_recent_window=None,repeat_cache_window=None): # indices seem to be a leftover from ACT variants, unused in fixed depth models
+    def forward(self, x, pos_emb_closure, cache_context, start_index, indices,collect_attention_diagnostics=False, 
+                attention_diagnostics_recent_window=None,repeat_cache_window=None,
+                recall_cache_intervention=None,
+                recall_target_repeat=None,
+                evolution_repeats=None,
+                recall_index=None): # indices seem to be a leftover from ACT variants, unused in fixed depth models
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         C = self.n_embd
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -648,6 +804,26 @@ class CausalSelfAttention(nn.Module): # should be able to use bidirectional as w
                 prefix_size = att_prefix.shape[-1]
                 current_size = att.shape[-1]
                 att = torch.cat((att_prefix, att), dim=-1)
+            if recall_cache_intervention is not None:
+                if att_prefix is not None:
+                    raise RuntimeError(
+                        "Recall cache interventions do not support "
+                        "external LM-cache prefixes."
+                    )
+
+                att = self.apply_recall_cache_intervention_mask(
+                    att,
+                    intervention=recall_cache_intervention,
+                    target_repeat=recall_target_repeat,
+                    evolution_repeats=evolution_repeats,
+                    recall_index=recall_index,
+                    tokens_per_repeat=T,
+                )
+
+            # if collect_attention_diagnostics:
+            #     att_logits = att
+
+            # att = F.softmax(att, dim=-1)
             if collect_attention_diagnostics==True:
 
                 att_logits = att
@@ -715,7 +891,15 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self,x,pos_emb_closure,cache_context,start_index,indices=None,collect_attention_diagnostics=False,attention_diagnostics_recent_window=None,repeat_cache_window=None):
+    def forward(self,x,pos_emb_closure,cache_context,
+                start_index,indices=None,
+                collect_attention_diagnostics=False,
+                attention_diagnostics_recent_window=None,
+                repeat_cache_window=None,
+                recall_cache_intervention=None,
+                recall_target_repeat=None,
+                evolution_repeats=None,
+                recall_index=None):
         attention_output, diagnostics = self.attn(
             self.ln_1(x),
             pos_emb_closure,
@@ -726,8 +910,13 @@ class Block(nn.Module):
             attention_diagnostics_recent_window=(
                 attention_diagnostics_recent_window
             ),
-            repeat_cache_window=(repeat_cache_window),
+            repeat_cache_window=repeat_cache_window,
+            recall_cache_intervention=recall_cache_intervention,
+            recall_target_repeat=recall_target_repeat,
+            evolution_repeats=evolution_repeats,
+            recall_index=recall_index,
         )
+
 
         x = x + attention_output
         x = x + self.mlp(self.ln_2(x))
@@ -851,7 +1040,9 @@ class GPTBase(nn.Module):
                 intervention_source_depth=None,
                 intervention_input_ids=None,
                 cache_reset_source_depth=None,
-                num_recall_repeats =1):
+                num_recall_repeats =1,
+                recall_cache_intervention=None,
+                recall_value_permutation_offset=1):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
@@ -879,7 +1070,64 @@ class GPTBase(nn.Module):
             if recall_repeats <= 0:
                 raise ValueError("num_recall_repeats must be positive.")
             
+        recall_target_repeat = None
+
+        if delayed_recall:
+            if isinstance(recall_age, bool) or not isinstance(recall_age, int):
+                raise TypeError("recall_age must be an integer.")
+
+            if not 0 <= recall_age < repeats:
+                raise ValueError(
+                    f"recall_age must be between 0 and {repeats - 1}."
+                )
+
+            recall_target_repeat = repeats - recall_age
+
+        if recall_cache_intervention is not None:
+            if recall_cache_intervention not in RECALL_CACHE_INTERVENTIONS:
+                raise ValueError(
+                    "Unsupported recall cache intervention: "
+                    f"{recall_cache_intervention!r}."
+                )
             
+            if not delayed_recall:
+                raise ValueError(
+                    "Recall cache interventions require delayed_recall=True."
+                )
+
+            if self.training:
+                raise ValueError(
+                    "Recall cache interventions are evaluation-only."
+                )
+
+     
+
+     
+            if repeat_cache_window is not None:
+                raise ValueError(
+                    "Recall cache interventions require the full-cache policy."
+                )
+
+            if (
+                recall_cache_intervention
+                in RECALL_ATTENTION_MASK_INTERVENTIONS
+                and any(
+                    block.attn.attention_implementation != "manual"
+                    for block in self.transformer.h_mid
+                )
+            ):
+                raise ValueError(
+                    "Recall attention masking requires manual attention."
+                )
+
+            if (
+                isinstance(recall_value_permutation_offset, bool)
+                or not isinstance(recall_value_permutation_offset, int)
+                or recall_value_permutation_offset <= 0
+            ):
+                raise ValueError(
+                    "recall_value_permutation_offset must be a positive integer."
+                )
 
 
         if repeats > self.config.ca_max_relative_age:
@@ -982,6 +1230,11 @@ class GPTBase(nn.Module):
                 raise ValueError(
                     "State intervention and cache reset must use the same source depth."
                 )
+        if recall_cache_intervention is not None:
+            if has_intervention_depth or has_cache_reset:
+                raise ValueError(
+                "Recall cache interventions cannot be combined with "
+                "clean-state or cache-reset interventions.")
         if return_attention_diagnostics and self.training:
             raise ValueError(
                 "Attention diagnostics are only supported in evaluation mode."
@@ -1056,7 +1309,31 @@ class GPTBase(nn.Module):
         total_expected_length = (repeats + (recall_repeats if delayed_recall else 0) ) * T          # TODO done
         for block in self.transformer.h_mid:
             block.attn.init_cache(total_expected_length)
-        sum_active = 0
+        recall_intervention_metadata = None
+
+        if delayed_recall:
+            recall_intervention_metadata = {
+                "condition": (
+                    recall_cache_intervention
+                    if recall_cache_intervention is not None
+                    else "baseline"
+                ),
+                "target_repeat": recall_target_repeat,
+                "recall_age": recall_age,
+                "num_evolution_repeats": repeats,
+                "num_recall_repeats": recall_repeats,
+                "target_cache_block_zero_based": recall_target_repeat - 1,
+                "target_token_start": (
+                    (recall_target_repeat - 1) * T
+                ),
+                "target_token_end_exclusive": (
+                    recall_target_repeat * T
+                ),
+                "value_permutations": 0,
+                "masked_attention_calls": 0,
+                "layers": [],
+            }
+        
         try:
             for rep_idx in range(1, repeats + 1):
                 relative_age = repeats - rep_idx + 1
@@ -1120,6 +1397,31 @@ class GPTBase(nn.Module):
                     repeat_logits.append(decoded_logits)
             if return_repeat_logits:
                 repeat_logits = torch.stack(repeat_logits, dim=1)
+
+            if (delayed_recall and recall_cache_intervention== "target-value-corruption"):
+                for middle_layer_index, block in enumerate(
+                    self.transformer.h_mid
+                ):
+                    layer_metadata = (
+                        block.attn.permute_cached_target_values(
+                            target_repeat=recall_target_repeat,
+                            tokens_per_repeat=T,
+                            permutation_offset=(
+                                recall_value_permutation_offset
+                            ),
+                        )
+                    )
+                    recall_intervention_metadata["layers"].append(
+                        {
+                            "middle_layer_index_zero_based": (
+                                middle_layer_index
+                            ),
+                            **layer_metadata,
+                        }
+                    )
+                    recall_intervention_metadata[
+                        "value_permutations"
+                    ] += 1
             if delayed_recall:
                 controller = make_controller(
                     ForwardBackwardEmbedding.RECALL,
@@ -1132,19 +1434,35 @@ class GPTBase(nn.Module):
 
                     for mid_idx,block in enumerate( self.transformer.h_mid):
                             
-                        x, diagnostics = block(
-                        x,
-                        pos_emb_closure,
-                        cache_context,
-                        start_index=index_shift,
-                        collect_attention_diagnostics=(
-                            return_attention_diagnostics
-                        ),
-                        attention_diagnostics_recent_window=(
-                            attention_diagnostics_recent_window
-                        ),
-                        repeat_cache_window=(active_repeat_cache_window),)
+                        active_recall_mask = (
+                            recall_cache_intervention
+                            if recall_cache_intervention
+                            in RECALL_ATTENTION_MASK_INTERVENTIONS
+                            else None
+                        )
 
+                        x, diagnostics = block(
+                            x,
+                            pos_emb_closure,
+                            cache_context,
+                            start_index=index_shift,
+                            collect_attention_diagnostics=(
+                                return_attention_diagnostics
+                            ),
+                            attention_diagnostics_recent_window=(
+                                attention_diagnostics_recent_window
+                            ),
+                            repeat_cache_window=active_repeat_cache_window,
+                            recall_cache_intervention=active_recall_mask,
+                            recall_target_repeat=recall_target_repeat,
+                            evolution_repeats=repeats,
+                            recall_index=recall_idx,
+                        )
+
+                        if active_recall_mask is not None:
+                            recall_intervention_metadata[
+                                "masked_attention_calls"
+                            ] += 1
                         if diagnostics is not None:
                             diagnostics["repeat_index"] = repeats+recall_idx        # TODO
                             diagnostics["middle_layer_index"] = mid_idx  # TODO
@@ -1208,10 +1526,17 @@ class GPTBase(nn.Module):
         }
         if return_repeat_states:
             result['repeat_states'] = repeat_states
+
         if return_attention_diagnostics:
             result['attention_diagnostics'] = attention_diagnostics
+
         if return_repeat_logits:
             result["repeat_logits"] = repeat_logits
+
+        if recall_intervention_metadata is not None:
+            result["recall_cache_intervention"] = (
+                recall_intervention_metadata
+            )
         return result
     def clear_state(self):
         self.lm_cache.clear_state()
