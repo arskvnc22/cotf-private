@@ -389,9 +389,7 @@ class GPTBase(nn.Module):
         self.config = config
         self.tokenizer = tiktoken.get_encoding("gpt2")
         self.n_repeat = config.n_repeat
-        self.initial_cell = getattr(config, "lstm_initial_cell", "zero")
-        if self.initial_cell not in ("zero", "initial_hidden"):
-            raise ValueError(f"Unsupported lstm_initial_cell: {self.initial_cell}")
+        self.persistent_cell = config.lstm_persistent_cell
 
 
         
@@ -473,6 +471,7 @@ class GPTBase(nn.Module):
         return_all_logits=False,
         num_repeats=None,
         return_repeat_states=False,
+        persistent_cell=None
     ):
         device = idx.device
         b, t = idx.size()
@@ -481,7 +480,8 @@ class GPTBase(nn.Module):
         if repeats <= 0:
             raise ValueError("num_repeats must be positive.")
         
-        
+        if persistent_cell is None:
+            persistent_cell = self.persistent_cell
         # forward the GPT model itself
         if use_cache:
             idx, index_shift, cache_context = self.lm_cache(idx)
@@ -509,13 +509,8 @@ class GPTBase(nn.Module):
 
 
 
-        # Initialise before h_begin. In the Rule 30 runs h_begin has zero blocks,
-        # so this is also the state entering the first recurrent block.
-        cell = (
-            x.clone()
-            if self.initial_cell == "initial_hidden"
-            else torch.zeros_like(x)
-        )
+        cell = torch.zeros_like(x)
+
         x, cell = run_blocks(
             x,
             cell,
@@ -533,14 +528,16 @@ class GPTBase(nn.Module):
         B, T, D = x.shape
         # fix_x = torch.zeros_like(x)
         # continue_prob = x.new_ones((B, T))
+        # mid_cell = torch.zeros_like(x)
         for rep_idx in range(1, repeats + 1):
-            # for block in self.transformer.h_mid:
-            #     x = block(x, pos_emb_closure, cache_context, start_index=index_shift)
+            repeat_cell = cell if persistent_cell else torch.zeros_like(x)
+
             x, cell = run_blocks(
-                        x,
-                        cell,
-                        self.transformer.h_mid,
-                    )
+                x,
+                repeat_cell,
+                self.transformer.h_mid,
+            )
+
             if return_repeat_states:
                 repeat_states.append(x)
             

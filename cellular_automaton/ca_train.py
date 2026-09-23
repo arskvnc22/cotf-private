@@ -103,6 +103,17 @@ def ca_selection_key(metrics, primary_metric):
     raise ValueError(f"Unsupported CA best metric: {primary_metric}.")
 
 
+def average_ca_selection_metrics(metrics):
+    """Average checkpoint-selection metrics over a fixed set of CA pairs."""
+    if not metrics:
+        raise ValueError("Average extrapolation selection requires at least one pair.")
+    fields = ("cell_accuracy", "exact_sequence_accuracy", "loss")
+    return {
+        field: math.fsum(float(values[field]) for values in metrics) / len(metrics)
+        for field in fields
+    }
+
+
 def extrapolation_checkpoint_eligible(
     id_metrics,
     *,
@@ -341,6 +352,7 @@ def train_ca(
     best_extrapolation_unconstrained_path = (
         checkpoint_dir / "best_extrapolation_unconstrained.json"
     )
+    best_average_extrap_path = checkpoint_dir / "best_average_extrap.json"
     legacy_best_path = checkpoint_dir / "best.json"
     legacy_best_extrapolation_path = checkpoint_dir / "best_extrapolation.json"
     stats = _load_json(
@@ -352,6 +364,7 @@ def train_ca(
             "best_id": None,
             "best_extrapolation_strict": None,
             "best_extrapolation_unconstrained": None,
+            "best_average_extrap": None,
         },
     )
     _set_and_validate_forward_policy(
@@ -362,6 +375,7 @@ def train_ca(
         "best_extrapolation_strict", stats.get("best_extrapolation")
     )
     stats.setdefault("best_extrapolation_unconstrained", None)
+    stats.setdefault("best_average_extrap", None)
     best_id_info = _load_json(
         best_id_path, _load_json(legacy_best_path, None)
     )
@@ -372,6 +386,7 @@ def train_ca(
     best_extrapolation_unconstrained_info = _load_json(
         best_extrapolation_unconstrained_path, None
     )
+    best_average_extrap_info = _load_json(best_average_extrap_path, None)
     stats["train"] = [row for row in stats["train"] if row["step"] <= start_step]
     stats["timing"] = [row for row in stats["timing"] if row["step"] <= start_step]
     stats["eval"] = {
@@ -410,6 +425,9 @@ def train_ca(
     if not selection_is_usable(best_extrapolation_unconstrained_info):
         best_extrapolation_unconstrained_info = None
         stats["best_extrapolation_unconstrained"] = None
+    if not selection_is_usable(best_average_extrap_info):
+        best_average_extrap_info = None
+        stats["best_average_extrap"] = None
 
     best_id_key = (
         tuple(best_id_info["selection_key"])
@@ -426,12 +444,20 @@ def train_ca(
         if best_extrapolation_unconstrained_info is not None
         else None
     )
+    best_average_extrap_key = (
+        tuple(best_average_extrap_info["selection_key"])
+        if best_average_extrap_info is not None
+        else None
+    )
     best_id_checkpoint_path = checkpoint_dir / "best_id.pt"
     best_extrapolation_strict_checkpoint_path = (
         checkpoint_dir / "best_extrapolation_strict.pt"
     )
     best_extrapolation_unconstrained_checkpoint_path = (
         checkpoint_dir / "best_extrapolation_unconstrained.pt"
+    )
+    best_average_extrap_checkpoint_path = (
+        checkpoint_dir / "best_average_extrap.pt"
     )
     legacy_best_checkpoint_path = checkpoint_dir / "best.pt"
     legacy_best_extrapolation_checkpoint_path = (
@@ -451,7 +477,8 @@ def train_ca(
         nonlocal best_extrapolation_strict_info
         nonlocal best_extrapolation_strict_key
         nonlocal best_extrapolation_unconstrained_info
-        nonlocal best_extrapolation_unconstrained_key, timing_start
+        nonlocal best_extrapolation_unconstrained_key
+        nonlocal best_average_extrap_info, best_average_extrap_key, timing_start
         distributed_backend.sync()
         if distributed_backend.is_master_process():
             excluded_start = time.perf_counter()
@@ -692,6 +719,63 @@ def train_ca(
                         best_extrapolation_strict_info,
                     )
 
+                average_source_metrics = [
+                    extrapolation_eval[ca_pair_key(*pair)]["by_length"][
+                        str(best_length)
+                    ]
+                    for pair in extrapolation_pairs
+                ]
+                average_extrapolation_metrics = average_ca_selection_metrics(
+                    average_source_metrics
+                )
+                candidate_average_key = ca_selection_key(
+                    average_extrapolation_metrics,
+                    args.ca_extrapolation_best_metric,
+                )
+                if (
+                    best_average_extrap_key is None
+                    or candidate_average_key > best_average_extrap_key
+                ):
+                    best_average_extrap_key = candidate_average_key
+                    best_average_extrap_info = {
+                        "step": int(step),
+                        "length": best_length,
+                        "metric": f"mean_{args.ca_extrapolation_best_metric}",
+                        "value": float(
+                            average_extrapolation_metrics[
+                                args.ca_extrapolation_best_metric
+                            ]
+                        ),
+                        "selection_key": list(candidate_average_key),
+                        "checkpoint": best_average_extrap_checkpoint_path.name,
+                        "selection_type": "average_extrapolation",
+                        "selection_aggregation": "arithmetic_mean",
+                        "selection_pairs": [list(pair) for pair in extrapolation_pairs],
+                        "per_pair_values": {
+                            ca_pair_key(*pair): float(
+                                metrics[args.ca_extrapolation_best_metric]
+                            )
+                            for pair, metrics in zip(
+                                extrapolation_pairs, average_source_metrics
+                            )
+                        },
+                        "minimum_id_cell_accuracy": min_id_cell_accuracy,
+                        "minimum_id_exact_sequence_accuracy": min_id_exact_accuracy,
+                        "strict_id_gate_passed": extrapolation_strict_eligible,
+                        "forward_policy": forward_policy_metadata,
+                    }
+                    save_model_checkpoint(
+                        best_average_extrap_checkpoint_path,
+                        model=raw_model,
+                        step=step,
+                        metadata=best_average_extrap_info,
+                    )
+                    stats["best_average_extrap"] = best_average_extrap_info
+                    _write_json(
+                        best_average_extrap_path,
+                        best_average_extrap_info,
+                    )
+
             repeat_summary = None
             if repeat_diagnostics is not None:
                 repeat_summary = {
@@ -729,6 +813,7 @@ def train_ca(
                         "best_extrapolation_unconstrained": (
                             best_extrapolation_unconstrained_info
                         ),
+                        "best_average_extrap": best_average_extrap_info,
                     },
                     indent=2,
                 )
@@ -1022,7 +1107,35 @@ def train_ca(
         else:
             trained_ca_steps = args.ca_steps
             trained_repeats = args.n_repeat if supports_repeat_override else None
+        if args.ca_final_repeat_diagnostic_max_repeats is None:
+            args.ca_final_repeat_diagnostic_max_repeats = (
+                args.ca_repeat_diagnostic_max_repeats
+            )
 
+        if args.ca_final_repeat_diagnostic_max_repeats is not None:
+            if args.ca_final_repeat_diagnostic_max_repeats <= 0:
+                raise ValueError(
+                    "--ca_final_repeat_diagnostic_max_repeats must be positive."
+                )
+            if (
+                args.ca_repeat_diagnostic_max_repeats is not None
+                and args.ca_final_repeat_diagnostic_max_repeats
+                < args.ca_repeat_diagnostic_max_repeats
+            ):
+                raise ValueError(
+                    "Final diagnostic depth cannot be smaller than scheduled "
+                    "diagnostic depth."
+                )
+        final_repeat_diagnostic_horizons = None
+        if args.ca_final_repeat_diagnostic_max_repeats is not None:
+            final_repeat_diagnostic_horizons = sorted(
+                set(args.ca_repeat_diagnostic_horizons or [])
+                | set(
+                    range(
+                        args.ca_final_repeat_diagnostic_max_repeats + 1
+                    )
+                )
+            )
         def evaluate_checkpoint(checkpoint_path, metadata, label):
             checkpoint = torch.load(checkpoint_path, map_location=args.device)
             raw_model.load_state_dict(checkpoint["model"], strict=True)
@@ -1041,9 +1154,9 @@ def train_ca(
                 external_ca_steps=args.ca_final_external_steps,
                 final_eval_max_batches=args.ca_final_eval_max_batches,
                 repeat_diagnostic_max_repeats=(
-                    args.ca_repeat_diagnostic_max_repeats
+                    args.ca_final_repeat_diagnostic_max_repeats
                 ),
-                repeat_diagnostic_horizons=args.ca_repeat_diagnostic_horizons,
+                repeat_diagnostic_horizons=final_repeat_diagnostic_horizons,
                 repeat_diagnostic_max_batches=(
                     args.ca_repeat_diagnostic_max_batches
                 ),
@@ -1074,12 +1187,20 @@ def train_ca(
                 best_extrapolation_unconstrained_info,
                 "best_extrapolation_unconstrained",
             )
+        best_average_extrap_checkpoint_eval = None
+        if best_average_extrap_info is not None:
+            best_average_extrap_checkpoint_eval = evaluate_checkpoint(
+                checkpoint_dir / best_average_extrap_info["checkpoint"],
+                best_average_extrap_info,
+                "best_average_extrap",
+            )
 
         stats["best_id"] = best_id_info
         stats["best_extrapolation_strict"] = best_extrapolation_strict_info
         stats["best_extrapolation_unconstrained"] = (
             best_extrapolation_unconstrained_info
         )
+        stats["best_average_extrap"] = best_average_extrap_info
         # Backward-compatible summary fields retain their historical meaning.
         stats["best"] = best_id_info
         stats["best_extrapolation"] = best_extrapolation_strict_info
@@ -1092,6 +1213,7 @@ def train_ca(
             "best_extrapolation_unconstrained": (
                 best_extrapolation_unconstrained_checkpoint_eval
             ),
+            "best_average_extrap": best_average_extrap_checkpoint_eval,
             # Compatibility aliases for existing analysis notebooks.
             "best_in_distribution": best_id_checkpoint_eval,
             "best_extrapolation": best_extrapolation_strict_checkpoint_eval,
@@ -1143,6 +1265,15 @@ def train_ca(
                     "repeat_diagnostics"
                 ],
             )
+        if best_average_extrap_checkpoint_eval is not None:
+            _write_json(
+                checkpoint_dir / "best_average_extrap_eval.json",
+                best_average_extrap_checkpoint_eval["task_metrics"],
+            )
+            _write_json(
+                checkpoint_dir / "best_average_extrap_repeat_diagnostics.json",
+                best_average_extrap_checkpoint_eval["repeat_diagnostics"],
+            )
         _write_json(checkpoint_dir / "summary.json", stats)
         if args.ca_run_dir is not None:
             write_eval_metrics(args.ca_run_dir, stats)
@@ -1181,6 +1312,15 @@ def train_ca(
                 ],
                 prefix="final_best_extrapolation_unconstrained",
             )
+        if best_average_extrap_checkpoint_eval is not None:
+            final_logs["best_average_extrap/step"] = (
+                best_average_extrap_info["step"]
+            )
+            add_scalar_metrics(
+                final_logs,
+                best_average_extrap_checkpoint_eval["task_metrics"],
+                prefix="final_best_average_extrap",
+            )
         _wandb_log(args, final_logs, args.iterations)
         print(
             json.dumps(
@@ -1192,6 +1332,7 @@ def train_ca(
                     "best_extrapolation_unconstrained": (
                         best_extrapolation_unconstrained_info
                     ),
+                    "best_average_extrap": best_average_extrap_info,
                     "best_id_final_eval": final_eval,
                     "best_extrapolation_strict_final_eval": (
                         best_extrapolation_strict_checkpoint_eval["task_metrics"]
@@ -1204,6 +1345,11 @@ def train_ca(
                         ]
                         if best_extrapolation_unconstrained_checkpoint_eval
                         is not None
+                        else None
+                    ),
+                    "best_average_extrap_final_eval": (
+                        best_average_extrap_checkpoint_eval["task_metrics"]
+                        if best_average_extrap_checkpoint_eval is not None
                         else None
                     ),
                     # Compatibility aliases for existing log parsers.

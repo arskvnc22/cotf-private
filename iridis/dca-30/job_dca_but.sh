@@ -5,6 +5,8 @@
 # Slurm owns stdout/stderr for this preset. It therefore writes only
 # slurm_JOBID.out and slurm_JOBID.err, without duplicate output.log/error.log.
 ################################################################################
+export MEMORY="${MEMORY:-32G}"
+export TIME_LIMIT="${TIME_LIMIT:-03:00:00}"
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from cellular_automaton.ca_train import (
     _set_and_validate_forward_policy,
+    average_ca_selection_metrics,
     ca_selection_key,
     extrapolation_checkpoint_eligible,
     extrapolation_checkpoint_updates,
@@ -61,6 +62,36 @@ def test_ca_best_key_uses_cell_accuracy_and_loss_as_tiebreakers():
     assert ca_selection_key(second, "exact_sequence_accuracy") > ca_selection_key(
         first, "exact_sequence_accuracy"
     )
+
+
+def test_average_extrapolation_metrics_use_all_configured_pairs():
+    averaged = average_ca_selection_metrics(
+        [
+            {
+                "cell_accuracy": 0.6,
+                "exact_sequence_accuracy": 0.2,
+                "loss": 0.8,
+            },
+            {
+                "cell_accuracy": 1.0,
+                "exact_sequence_accuracy": 0.6,
+                "loss": 0.4,
+            },
+        ]
+    )
+
+    assert averaged == pytest.approx(
+        {
+            "cell_accuracy": 0.8,
+            "exact_sequence_accuracy": 0.4,
+            "loss": 0.6,
+        }
+    )
+
+
+def test_average_extrapolation_metrics_require_a_pair():
+    with pytest.raises(ValueError, match="at least one pair"):
+        average_ca_selection_metrics([])
 
 
 def test_strict_extrapolation_gate_uses_worst_training_pair():

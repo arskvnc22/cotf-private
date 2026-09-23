@@ -126,6 +126,24 @@ def get_args():
         help="Number of Rule 30 updates between each input row and target row.",
     )
     parser.add_argument(
+    "--lstm_initial_cell",
+    choices=("zero", "initial_hidden"),
+    default="zero",
+    help=(
+        "Initial LSTM-UT cell state. 'initial_hidden' copies the token "
+        "embedding after positional input adaptation, before the first block."
+    ),
+    )
+    parser.add_argument(
+    "--ca_final_repeat_diagnostic_max_repeats",
+    type=int,
+    default=None,
+    help=(
+        "Maximum repeat depth used only for final checkpoint diagnostics. "
+        "Defaults to --ca_repeat_diagnostic_max_repeats."
+    ),
+    )
+    parser.add_argument(
         "--attention_implementation",
         choices=("sdpa", "manual"),
         default="sdpa",
@@ -134,23 +152,23 @@ def get_args():
             "Manual attention remains separate from diagnostic collection."
         ),
     )
-    parser.add_argument(
-        "--lstm_forget_gate",
-        choices=("learned", "none"),
-        default="learned",
-        help=(
-            "LSTM-UT retention ablation. 'learned' uses a learned forget gate; "
-            "'none' retains the previous cell exactly before the additive write."
-        ),
-    )
-    parser.add_argument(
-        "--lstm_control_input",
-        choices=("previous_and_proposed", "proposed"),
-        default="previous_and_proposed",
-        help=(
-            "Inputs used by the LSTM-UT forget, write, proposal, and hidden gates."
-        ),
-    )
+    # parser.add_argument(
+    #     "--lstm_forget_gate",
+    #     choices=("learned", "none"),
+    #     default="learned",
+    #     help=(
+    #         "LSTM-UT retention ablation. 'learned' uses a learned forget gate; "
+    #         "'none' retains the previous cell exactly before the additive write."
+    #     ),
+    # )
+    # parser.add_argument(
+    #     "--lstm_control_input",
+    #     choices=("previous_and_proposed", "proposed"),
+    #     default="previous_and_proposed",
+    #     help=(
+    #         "Inputs used by the LSTM-UT forget, write, proposal, and hidden gates."
+    #     ),
+    # )
 
     parser.add_argument(
         "--ca_train_pairs",
@@ -671,6 +689,26 @@ def apply_ca_task_config(args, distributed_backend):
         args.ca_repeat_diagnostic_max_repeats = max(
             repeats for _, repeats in configured_pairs
         )
+
+    if args.ca_final_repeat_diagnostic_max_repeats is None:
+        args.ca_final_repeat_diagnostic_max_repeats = (
+            args.ca_repeat_diagnostic_max_repeats
+        )
+
+    if args.ca_final_repeat_diagnostic_max_repeats is not None:
+        if args.ca_final_repeat_diagnostic_max_repeats <= 0:
+            raise ValueError(
+                "--ca_final_repeat_diagnostic_max_repeats must be positive."
+            )
+        if (
+            args.ca_repeat_diagnostic_max_repeats is not None
+            and args.ca_final_repeat_diagnostic_max_repeats
+            < args.ca_repeat_diagnostic_max_repeats
+        ):
+            raise ValueError(
+                "Final diagnostic depth cannot be smaller than scheduled "
+                "diagnostic depth."
+            )
     if args.ca_repeat_diagnostic_max_repeats is not None:
         if args.ca_repeat_diagnostic_max_repeats <= 0:
             raise ValueError("--ca_repeat_diagnostic_max_repeats must be positive.")

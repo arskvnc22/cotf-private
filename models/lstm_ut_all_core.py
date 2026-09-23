@@ -234,93 +234,21 @@ class MLP(nn.Module):
 
 
 
-class Block(nn.Module):
-
+class TransformerBlock(nn.Module):
     def __init__(self, config, lm_cache):
         super().__init__()
-        self.config = config
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config, lm_cache)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
-        self.memory_gate_norm = nn.LayerNorm(config.n_embd)
-
-        self.forget_gate_mode = config.lstm_forget_gate
-        self.control_input = config.lstm_control_input
-
-        if self.forget_gate_mode not in ("learned", "none"):
-            raise ValueError(
-                f"Unsupported lstm_forget_gate: {self.forget_gate_mode}"
-            )
-        if self.control_input not in (
-            "previous_and_proposed",
-            "proposed",
-        ):
-            raise ValueError(
-                f"Unsupported lstm_control_input: {self.control_input}"
-            )
-
-        use_previous_hidden = (
-            self.control_input == "previous_and_proposed"
-        )
-
-        def previous_projection():
-            if not use_previous_hidden:
-                return None
-            return nn.Linear(
-                config.n_embd,
-                config.n_embd,
-                bias=config.bias,
-            )
-
-        def proposed_projection():
-            return nn.Linear(
-                config.n_embd,
-                config.n_embd,
-                bias=config.bias,
-            )
-
-        if self.forget_gate_mode == "learned":
-            self.previous_to_forget = previous_projection()
-            self.proposed_to_forget = proposed_projection()
-        else:
-            self.previous_to_forget = None
-            self.proposed_to_forget = None
-
-        self.previous_to_write = previous_projection()
-        self.proposed_to_write = proposed_projection()
-
-        self.previous_to_memory_proposal = previous_projection()
-        self.proposed_to_memory_proposal = proposed_projection()
-
-        self.previous_to_hidden = previous_projection()
-        self.proposed_to_hidden = proposed_projection()
-
-    @staticmethod
-    def _control_projection(
-        previous_hidden,
-        proposed_hidden,
-        previous_projection,
-        proposed_projection,
-    ):
-        value = proposed_projection(proposed_hidden)
-        if previous_projection is not None:
-            value = value + previous_projection(previous_hidden)
-        return value
 
     def forward(
         self,
         x,
-        cell,
         pos_emb_closure,
         cache_context,
         start_index,
-        indices=None,
     ):
-        del indices
-
-        previous_hidden = self.memory_gate_norm(x)
-
         x = x + self.attn(
             self.ln_1(x),
             pos_emb_closure,
@@ -328,55 +256,156 @@ class Block(nn.Module):
             start_index,
         )
         x = x + self.mlp(self.ln_2(x))
+        return x
 
-        proposed_hidden = self.memory_gate_norm(x)
+
+class GatedTransformerBlock(nn.Module):
+    def __init__(self, config, lm_cache):
+        super().__init__()
+        self.block = TransformerBlock(config, lm_cache)
+        self.transition = LoopLSTMTransition(config)
+
+    def forward(
+        self, hidden, cell, pos_emb_closure, cache_context, start_index
+    ):
+        block_start = hidden
+        block_end = self.block(
+            hidden,
+            pos_emb_closure,
+            cache_context,
+            start_index,
+        )
+        return self.transition(block_start, block_end, cell)
+
+class LoopLSTMTransition(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+
+        self.memory_gate_norm = nn.LayerNorm(config.n_embd)
+        self.forget_gate_mode = config.lstm_forget_gate
+        self.control_input = config.lstm_control_input
+
+        if self.forget_gate_mode not in ("learned", "none"):
+            raise ValueError(
+                f"Unsupported lstm_forget_gate: "
+                f"{self.forget_gate_mode}"
+            )
+
+        if self.control_input not in (
+            "previous_and_proposed",
+            "proposed",
+        ):
+            raise ValueError(
+                f"Unsupported lstm_control_input: "
+                f"{self.control_input}"
+            )
+
+        use_loop_start = (
+            self.control_input == "previous_and_proposed"
+        )
+
+        def start_projection():
+            if not use_loop_start:
+                return None
+            return nn.Linear(
+                config.n_embd,
+                config.n_embd,
+                bias=config.bias,
+            )
+
+        def end_projection():
+            return nn.Linear(
+                config.n_embd,
+                config.n_embd,
+                bias=config.bias,
+            )
+
+        if self.forget_gate_mode == "learned":
+            self.start_to_forget = start_projection()
+            self.end_to_forget = end_projection()
+        else:
+            self.start_to_forget = None
+            self.end_to_forget = None
+
+        self.start_to_write = start_projection()
+        self.end_to_write = end_projection()
+
+        self.start_to_memory_proposal = start_projection()
+        self.end_to_memory_proposal = end_projection()
+
+        self.start_to_hidden = start_projection()
+        self.end_to_hidden = end_projection()
+
+    @staticmethod
+    def _control_projection(
+        loop_start,
+        loop_end,
+        start_projection,
+        end_projection,
+    ):
+        value = end_projection(loop_end)
+
+        if start_projection is not None:
+            value = value + start_projection(loop_start)
+
+        return value
+
+    def forward(self, loop_start, loop_end, cell):
+        # The same normalizer is deliberately shared so that the two
+        # representations are compared in the same normalized space.
+        normalized_start = self.memory_gate_norm(loop_start)
+        normalized_end = self.memory_gate_norm(loop_end)
 
         if self.forget_gate_mode == "learned":
             forget_gate = torch.sigmoid(
                 self._control_projection(
-                    previous_hidden,
-                    proposed_hidden,
-                    self.previous_to_forget,
-                    self.proposed_to_forget,
+                    normalized_start,
+                    normalized_end,
+                    self.start_to_forget,
+                    self.end_to_forget,
                 )
             )
             retained_memory = forget_gate * cell
         else:
-            # No forget gate means exact additive retention.
             retained_memory = cell
 
         write_gate = torch.sigmoid(
             self._control_projection(
-                previous_hidden,
-                proposed_hidden,
-                self.previous_to_write,
-                self.proposed_to_write,
+                normalized_start,
+                normalized_end,
+                self.start_to_write,
+                self.end_to_write,
             )
         )
 
         memory_proposal = torch.tanh(
             self._control_projection(
-                previous_hidden,
-                proposed_hidden,
-                self.previous_to_memory_proposal,
-                self.proposed_to_memory_proposal,
+                normalized_start,
+                normalized_end,
+                self.start_to_memory_proposal,
+                self.end_to_memory_proposal,
             )
         )
 
-        cell = retained_memory + write_gate * memory_proposal
+        cell = (
+            retained_memory
+            + write_gate * memory_proposal
+        )
 
         hidden_gate = torch.sigmoid(
             self._control_projection(
-                previous_hidden,
-                proposed_hidden,
-                self.previous_to_hidden,
-                self.proposed_to_hidden,
+                normalized_start,
+                normalized_end,
+                self.start_to_hidden,
+                self.end_to_hidden,
             )
         )
 
-        x = x + hidden_gate * torch.tanh(cell)  # should x be replaced by proposed hidden? # TODO
-        return x, cell
+        # Preserve the current model's residual exposure semantics:
+        # expose gated memory by adding it to the raw loop result.
+        hidden = loop_end + hidden_gate * torch.tanh(cell)
 
+        return hidden, cell
 
 class GPTBase(nn.Module):
 
@@ -389,28 +418,42 @@ class GPTBase(nn.Module):
         self.config = config
         self.tokenizer = tiktoken.get_encoding("gpt2")
         self.n_repeat = config.n_repeat
-        self.initial_cell = getattr(config, "lstm_initial_cell", "zero")
-        if self.initial_cell not in ("zero", "initial_hidden"):
-            raise ValueError(f"Unsupported lstm_initial_cell: {self.initial_cell}")
+        self.persistent_cell = config.lstm_persistent_cell
 
 
         
         self.lm_cache = caches.get_cache(config.lm_cache)(config)
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = positional_encoders.get_encoder(config.positional_encoder)(config),
-            drop = nn.Dropout(config.dropout),
-            h_begin = nn.ModuleList( 
-                [Block(config, self.lm_cache) for _ in range(config.n_layer_begin)]
-            ),
-            h_mid = nn.ModuleList(
-                [Block(config, self.lm_cache) 
-                for _ in range(config.n_layer_begin, config.n_layer - config.n_layer_end)],
-            ),
-            h_end = nn.ModuleList( 
-                [Block(config, self.lm_cache) 
-                for _ in range(config.n_layer - config.n_layer_end, config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            wte=nn.Embedding(config.vocab_size, config.n_embd),
+            wpe=positional_encoders.get_encoder(
+                config.positional_encoder
+            )(config),
+            drop=nn.Dropout(config.dropout),
+
+            h_begin=nn.ModuleList([
+                GatedTransformerBlock(config, self.lm_cache)
+                for _ in range(config.n_layer_begin)
+            ]),
+
+            h_mid=nn.ModuleList([
+                TransformerBlock(config, self.lm_cache)
+                for _ in range(
+                    config.n_layer_begin,
+                    config.n_layer - config.n_layer_end,
+                )
+            ]),
+
+            loop_transition=LoopLSTMTransition(config),
+
+            h_end=nn.ModuleList([
+                GatedTransformerBlock(config, self.lm_cache)
+                for _ in range(
+                    config.n_layer - config.n_layer_end,
+                    config.n_layer,
+                )
+            ]),
+
+            ln_f=LayerNorm(config.n_embd, bias=config.bias),
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -473,6 +516,7 @@ class GPTBase(nn.Module):
         return_all_logits=False,
         num_repeats=None,
         return_repeat_states=False,
+        persistent_cell=None
     ):
         device = idx.device
         b, t = idx.size()
@@ -481,7 +525,8 @@ class GPTBase(nn.Module):
         if repeats <= 0:
             raise ValueError("num_repeats must be positive.")
         
-        
+        if persistent_cell is None:
+            persistent_cell = self.persistent_cell
         # forward the GPT model itself
         if use_cache:
             idx, index_shift, cache_context = self.lm_cache(idx)
@@ -496,60 +541,71 @@ class GPTBase(nn.Module):
         x = self.transformer.drop(x)
         x = pos_emb_closure.adapt_model_input(x, start_index=index_shift) # does nothign with rope index shift is for autoregressive generation which we don't intend to use we dont have lm cacahe anywyay its annoying
 
-        def run_blocks(hidden, cell, blocks):
+        def run_gated_blocks(hidden, cell, blocks):
+                    for block in blocks:
+                        hidden, cell = block(
+                            hidden,
+                            cell,
+                            pos_emb_closure,
+                            cache_context,
+                            start_index=index_shift,
+                        )
+                    return hidden, cell
+        def run_transformer_blocks(hidden, blocks):
             for block in blocks:
-                hidden, cell = block(
+                hidden = block(
                     hidden,
-                    cell,
                     pos_emb_closure,
                     cache_context,
                     start_index=index_shift,
                 )
-            return hidden, cell
+            return hidden
 
 
 
-        # Initialise before h_begin. In the Rule 30 runs h_begin has zero blocks,
-        # so this is also the state entering the first recurrent block.
-        cell = (
-            x.clone()
-            if self.initial_cell == "initial_hidden"
-            else torch.zeros_like(x)
-        )
-        x, cell = run_blocks(
+
+        
+        cell = torch.zeros_like(x)
+        x, cell = run_gated_blocks( #prelude
             x,
             cell,
             self.transformer.h_begin,
         )
-        # for block in self.transformer.h_begin:
-        #     x = block(x, pos_emb_closure, cache_context, start_index=index_shift)
-        
 
-        # Evaluation-only repeat diagnostics use these snapshots to determine
-        # whether the shared middle stack converges, cycles, or leaves the
-        # representation manifold. The first entry is the post-begin state.
+
+        # The recurrent cell begins after the prefix.
+
         repeat_states = [x] if return_repeat_states else None
-        
-        B, T, D = x.shape
-        # fix_x = torch.zeros_like(x)
-        # continue_prob = x.new_ones((B, T))
+
         for rep_idx in range(1, repeats + 1):
-            # for block in self.transformer.h_mid:
-            #     x = block(x, pos_emb_closure, cache_context, start_index=index_shift)
-            x, cell = run_blocks(
-                        x,
-                        cell,
-                        self.transformer.h_mid,
-                    )
+            loop_start = x
+
+            loop_end = run_transformer_blocks(
+                loop_start,
+                self.transformer.h_mid,
+            )
+
+            if persistent_cell:
+                loop_cell = cell
+            else:
+                loop_cell = torch.zeros_like(loop_end)
+
+            # Exactly one gated update per complete middle-stack application.
+            x, cell = self.transformer.loop_transition(
+                loop_start,
+                loop_end,
+                loop_cell,
+            )
+
             if return_repeat_states:
                 repeat_states.append(x)
-            
-            
-        x, cell = run_blocks(
-                x,
-                cell,
-                self.transformer.h_end,
-            )   
+
+        x, cell = run_gated_blocks(     #coda 
+            x,
+            cell,
+            self.transformer.h_end,
+        )
+
         x = self.transformer.ln_f(x)
 
         if use_cache:

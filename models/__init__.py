@@ -18,6 +18,12 @@ from . import dca_cotf_cache
 from . import dca_cotf_att_intervene
 from . import dca_lstm_ut
 from . import lstm_ut_bidir
+from . import cotformer_llm
+from . import but_llm
+from . import lstm_ut_llm
+from . import lstm_ut_core
+from . import lstm_ut_all_core
+
 
 MODELS = {
     "base": base.GPTBase,
@@ -40,6 +46,12 @@ MODELS = {
     "dca_cotf_att_intervene" : dca_cotf_att_intervene.GPTBase,
     "dca_lstm_ut" : dca_lstm_ut.GPTBase,
     "lstm_ut_bidir" : lstm_ut_bidir.GPTBase,
+    "lstm_ut_llm" : lstm_ut_llm.GPTBase,
+    "cotformer_llm" : cotformer_llm.GPTBase,
+    "but_llm" : but_llm.GPTBase,
+    "lstm_ut_core" : lstm_ut_core.GPTBase,
+    "lstm_ut_all_core" : lstm_ut_all_core.GPTBase,
+
     
     
 }

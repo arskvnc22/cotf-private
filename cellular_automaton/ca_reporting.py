@@ -168,6 +168,7 @@ def build_run_manifest(
         "ca_controller_application",
         "lstm_forget_gate",
         "lstm_control_input",
+        "lstm_initial_cell",
         "positional_encoder",
         "n_layer_begin",
         "n_layer_end",
@@ -1150,6 +1151,7 @@ def normalize_training_stats(
         "best_internal_recall",
         "best_extrapolation_strict",
         "best_extrapolation_unconstrained",
+        "best_average_extrap",
     )
     analyses = stats.get("checkpoint_analysis", {})
     for checkpoint_type in canonical_checkpoints:

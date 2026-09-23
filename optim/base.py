@@ -90,9 +90,9 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
             with type_ctx:
                 with distributed_backend.get_context_for_microstep_forward(model=model, microstep_idx=microstep_idx, gradient_accumulation_steps=acc_steps):
                     if getattr(distributed_backend.get_raw_model(model), "needs_iter", False):
-                        outputs = model(x, targets=y, iter=itr, log_metrics=is_log_step)  # Pass log_metrics flag to model
+                        outputs = model(x, targets=y, iter=itr)  
                     else:
-                        outputs = model(x, targets=y, log_metrics=is_log_step)  # Pass log_metrics flag to model
+                        outputs = model(x, targets=y)
 
             loss = outputs['loss'] / acc_steps
             loss.backward()
@@ -148,42 +148,42 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                 model.eval()
                 
                 ### NEW BEGIN
-                x_diag, y_diag = get_batch(data_val_iter, device=extra_args.device)
-                with torch.no_grad(), type_ctx:
-                    # Get raw model ONCE
-                    raw_model = distributed_backend.get_raw_model(model)
+                # x_diag, y_diag = get_batch(data_val_iter, device=extra_args.device)
+                # with torch.no_grad(), type_ctx:
+                #     # Get raw model ONCE
+                #     raw_model = distributed_backend.get_raw_model(model)
                     
-                    diag_outputs = raw_model(x_diag, targets=y_diag)
+                #     diag_outputs = raw_model(x_diag, targets=y_diag)
                     
-                    # 1. Grab stream geometry and the new attention dictionary
-                    b_sim = diag_outputs.get('sim_of_xs')
-                    v_in = diag_outputs.get('var_into')
-                    v_out = diag_outputs.get('var_outof')
-                    d_metrics = diag_outputs.get('diag_metrics')
+                #     # 1. Grab stream geometry and the new attention dictionary
+                #     b_sim = diag_outputs.get('sim_of_xs')
+                #     v_in = diag_outputs.get('var_into')
+                #     v_out = diag_outputs.get('var_outof')
+                #     d_metrics = diag_outputs.get('diag_metrics')
                     
-                    # 2. Track LayerNorm Gamma Magnitudes for h_mid
-                    ln1_norm, ln2_norm = 0.0, 0.0
-                    mid_blocks = raw_model.transformer.h_mid
+                #     # 2. Track LayerNorm Gamma Magnitudes for h_mid
+                #     ln1_norm, ln2_norm = 0.0, 0.0
+                #     mid_blocks = raw_model.transformer.h_mid
                     
-                    ln1_norms = []
-                    ln2_norms = []
+                #     ln1_norms = []
+                #     ln2_norms = []
                     
-                    if len(mid_blocks) > 0:
-                        for block in mid_blocks:
-                            ln1_norms.append(block.ln_1.weight.abs().mean().item())
-                            ln2_norms.append(block.ln_2.weight.abs().mean().item())
+                #     if len(mid_blocks) > 0:
+                #         for block in mid_blocks:
+                #             ln1_norms.append(block.ln_1.weight.abs().mean().item())
+                #             ln2_norms.append(block.ln_2.weight.abs().mean().item())
                     
-                    # Store the arrays in the metrics dictionary
-                    if d_metrics is not None:
-                        d_metrics['ln1_gamma_per_layer'] = ln1_norms
-                        d_metrics['ln2_gamma_per_layer'] = ln2_norms
+                #     # Store the arrays in the metrics dictionary
+                #     if d_metrics is not None:
+                #         d_metrics['ln1_gamma_per_layer'] = ln1_norms
+                #         d_metrics['ln2_gamma_per_layer'] = ln2_norms
                 train_loss = loss.detach().cpu().item() * acc_steps
                 current_lr = scheduler.get_last_lr()[0] if scheduler is not None else extra_args.lr
                 # eval_steps = (
                 #     24 if itr < iterations else len(data_val)
                 # )
                 # If we are at the last iteration, re-initialize the data iterator
-                eval_steps = 24
+                eval_steps = len(data_val) if itr == iterations else 24
                 if itr == iterations:
                     data_val_iter = iter(data_val)
 
@@ -193,13 +193,40 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                 #     extra_args.device,
                 #     max_num_batches=eval_steps,
                 #     ctx=type_ctx,
+
                 # )
+                if itr==iterations:
+                    print(
+                        f"Running full final validation: {eval_steps} batches. "
+                        f"Starting at {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                        flush=True,
+                    )
+                else:
+                    # Use a small validation sample during training.
+                    eval_steps = 24
+
+                    print(
+                        f"Running ordinary validation: {eval_steps} batches. "
+                        f"Starting at {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                        flush=True,
+                    )
+                eval_start_time = time.perf_counter()
+
                 val_acc, val_loss, val_perplexity, avg_depth = eval( # changed eval to return 
                     distributed_backend.get_raw_model(model),
                     data_val_iter,
                     extra_args.device,
                     max_num_batches=eval_steps,
                     ctx=type_ctx,
+                )
+                eval_elapsed_seconds = time.perf_counter() - eval_start_time
+
+                print(
+                    f"Validation finished at {time.strftime('%Y-%m-%d %H:%M:%S')}. "
+                    f"Evaluated {eval_steps} batches in "
+                    f"{eval_elapsed_seconds:.2f} seconds "
+                    f"({eval_elapsed_seconds / 60:.2f} minutes).",
+                    flush=True,
                 )
 
                 # Gradient norm stats over the eval interval
@@ -213,7 +240,6 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                 if scheduler is not None:
                     print_string += f" [lr] {current_lr:.5f}"
                 print_string += f" [grad_norm] {cur_grad_norm:.4f} [max_grad_norm] {max_grad_norm:.4f}"
-                print_string += f" [sim] {b_sim:.3f} [v_in] {v_in:.2f} [v_out] {v_out:.2f}" # NEW
                 print(print_string)
 
                 stats["train_loss"].append(train_loss)
@@ -262,47 +288,47 @@ def train_base(model, opt, data, data_seed, scheduler, iterations, acc_steps, ba
                         "train/mean_grad_norm": mean_grad_norm,
                         
                         # --- Custom Stream & LN Diagnostics ---
-                        "diag/boundary_sim": b_sim,
-                        "diag/var_into": v_in,
-                        "diag/var_outof": v_out,
+                        # "diag/boundary_sim": b_sim,
+                        # "diag/var_into": v_in,
+                        # "diag/var_outof": v_out,
                         # "diag/avg_ln_gamma": avg_ln_gamma_magnitude,
                         # "diag/ln1_gamma": ln1_norm,
                         # "diag/ln2_gamma": ln2_norm,
                     }
-                    if hasattr(raw_model, 'backward_metrics'):       # NEW PER REPEAT GRADS
-                        for key, val in raw_model.backward_metrics.items():
-                            logs[f"diag_grad/{key}"] = val
-                        raw_model.backward_metrics.clear()
-                    # CLEAR MEMORY
-                    if hasattr(raw_model, 'forward_metrics'):
-                        for key, val in raw_model.forward_metrics.items():
-                            logs[f"diag_step/{key}"] = val  
-                        raw_model.forward_metrics.clear() # Clear memory 
+                    # if hasattr(raw_model, 'backward_metrics'):       # NEW PER REPEAT GRADS
+                    #     for key, val in raw_model.backward_metrics.items():
+                    #         logs[f"diag_grad/{key}"] = val
+                    #     raw_model.backward_metrics.clear()
+                    # # CLEAR MEMORY
+                    # if hasattr(raw_model, 'forward_metrics'):
+                    #     for key, val in raw_model.forward_metrics.items():
+                    #         logs[f"diag_step/{key}"] = val  
+                    #     raw_model.forward_metrics.clear() # Clear memory 
                     
 
-                    if 'ln1_gamma_per_layer' in d_metrics:
-                        for idx, val in enumerate(d_metrics['ln1_gamma_per_layer']):           # still not sure about these. look into it tomorrow
-                            logs[f"diag_ln/ln1_layer_{idx}"] = float(val)
-                            logs[f"diag_ln/ln2_layer_{idx}"] = float(d_metrics['ln2_gamma_per_layer'][idx])
-                    raw_model = distributed_backend.get_raw_model(model)
-                    if d_metrics is not None:
-                        # Macro Logging (Network-wide averages)
-                        logs["diag_macro/repeat_entropy"] = float(d_metrics.get('macro_rep_entropy', 0.0))
+                    # if 'ln1_gamma_per_layer' in d_metrics:
+                    #     for idx, val in enumerate(d_metrics['ln1_gamma_per_layer']):           # still not sure about these. look into it tomorrow
+                    #         logs[f"diag_ln/ln1_layer_{idx}"] = float(val)
+                    #         logs[f"diag_ln/ln2_layer_{idx}"] = float(d_metrics['ln2_gamma_per_layer'][idx])
+                    # raw_model = distributed_backend.get_raw_model(model)
+                    # if d_metrics is not None:
+                    #     # Macro Logging (Network-wide averages)
+                    #     logs["diag_macro/repeat_entropy"] = float(d_metrics.get('macro_rep_entropy', 0.0))
                         
-                        if 'macro_budget' in d_metrics:
-                            num_repeats = len(d_metrics['macro_budget'])
-                            for r in range(num_repeats):
-                                loop_num = r + 1
-                                logs[f"diag_macro/budget_loop_{loop_num}"] = float(d_metrics['macro_budget'][r])
-                                logs[f"diag_macro/within_entropy_loop_{loop_num}"] = float(d_metrics['macro_in_entropy'][r])
-                                logs[f"diag_macro/same_pos_budget_loop_{loop_num}"] = float(d_metrics['macro_same_pos'][r])
+                    #     if 'macro_budget' in d_metrics:
+                    #         num_repeats = len(d_metrics['macro_budget'])
+                    #         for r in range(num_repeats):
+                    #             loop_num = r + 1
+                    #             logs[f"diag_macro/budget_loop_{loop_num}"] = float(d_metrics['macro_budget'][r])
+                    #             logs[f"diag_macro/within_entropy_loop_{loop_num}"] = float(d_metrics['macro_in_entropy'][r])
+                    #             logs[f"diag_macro/same_pos_budget_loop_{loop_num}"] = float(d_metrics['macro_same_pos'][r])
                             
-                            # Micro Logging (Track specific heads to watch them specialize)
-                            for h in [0, 5, 11]:
-                                if h < len(d_metrics['head_rep_entropy']): # Safety check
-                                    logs[f"diag_head_{h}/repeat_entropy"] = float(d_metrics['head_rep_entropy'][h])
-                                    for r in range(num_repeats):
-                                        logs[f"diag_head_{h}/budget_loop_{r+1}"] = float(d_metrics['head_budget'][h, r])
+                    #         # Micro Logging (Track specific heads to watch them specialize)
+                    #         for h in [0, 5, 11]:
+                    #             if h < len(d_metrics['head_rep_entropy']): # Safety check
+                    #                 logs[f"diag_head_{h}/repeat_entropy"] = float(d_metrics['head_rep_entropy'][h])
+                    #                 for r in range(num_repeats):
+                    #                     logs[f"diag_head_{h}/budget_loop_{r+1}"] = float(d_metrics['head_budget'][h, r])
 
                     if itr == iterations:
                         logs["val/final-ppl"] = val_perplexity

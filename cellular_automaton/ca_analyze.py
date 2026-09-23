@@ -592,8 +592,13 @@ def configuration_label(manifest: Mapping[str, Any]) -> str:
 
     lstm_configuration = ""
     if forget_gate is not None:
+        initial_cell = dotted_get(
+            manifest, "model.lstm_initial_cell", "zero"
+        )
         lstm_configuration = (
-            f" lstm-forget={forget_gate} lstm-control={control_input}"
+            f" lstm-forget={forget_gate}"
+            f" lstm-control={control_input}"
+            f" lstm-initial-cell={initial_cell}"
         )
 
     return (

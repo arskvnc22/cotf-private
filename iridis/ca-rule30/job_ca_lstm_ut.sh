@@ -16,6 +16,7 @@ set -e
 PACKAGE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 EFFECTIVE_FORGET_GATE="${LSTM_FORGET_GATE:-learned}"
+EFFECTIVE_INITIAL_CELL="${LSTM_INITIAL_CELL:-zero}"
 EFFECTIVE_CONTROL_INPUT="${LSTM_CONTROL_INPUT:-previous_and_proposed}"
 EFFECTIVE_SEED="${SEED:-1}"
 EFFECTIVE_EXP_NAME="${EXP_NAME:-}"
@@ -28,6 +29,10 @@ while [ "$ARG_INDEX" -lt "${#CLI_ARGS[@]}" ]; do
     case "${CLI_ARGS[$ARG_INDEX]}" in
         --lstm_forget_gate)
             EFFECTIVE_FORGET_GATE="${CLI_ARGS[$((ARG_INDEX + 1))]}"
+            ARG_INDEX=$((ARG_INDEX + 2))
+            ;;
+        --lstm_initial_cell)
+            EFFECTIVE_INITIAL_CELL="${CLI_ARGS[$((ARG_INDEX + 1))]}"
             ARG_INDEX=$((ARG_INDEX + 2))
             ;;
         --lstm_control_input)
@@ -49,15 +54,22 @@ while [ "$ARG_INDEX" -lt "${#CLI_ARGS[@]}" ]; do
 done
 
 if [ -z "$EFFECTIVE_EXP_NAME" ]; then
-    EFFECTIVE_EXP_NAME="ca30_lstm_ut_fg_${EFFECTIVE_FORGET_GATE}_control_${EFFECTIVE_CONTROL_INPUT}_seed_${EFFECTIVE_SEED}"
+    EFFECTIVE_EXP_NAME="ca30_lstm_ut_fg_${EFFECTIVE_FORGET_GATE}_control_${EFFECTIVE_CONTROL_INPUT}_cell_${EFFECTIVE_INITIAL_CELL}_seed_${EFFECTIVE_SEED}"
 fi
-
+case "$EFFECTIVE_INITIAL_CELL" in
+    zero|initial_hidden) ;;
+    *)
+        echo "Unsupported LSTM_INITIAL_CELL: $EFFECTIVE_INITIAL_CELL" >&2
+        exit 2
+        ;;
+esac
 PRESET_ARGS=(
     --model "${MODEL:-lstm_ut_bidir}"
     --attention_mode "${ATTENTION_MODE:-bidirectional}"
     --positional_encoder "${POSITIONAL_ENCODER:-rotary}"
     --lstm_forget_gate "$EFFECTIVE_FORGET_GATE"
     --lstm_control_input "$EFFECTIVE_CONTROL_INPUT"
+    --lstm_initial_cell "$EFFECTIVE_INITIAL_CELL"
     --exp_name "$EFFECTIVE_EXP_NAME"
 )
 

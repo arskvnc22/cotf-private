@@ -32,7 +32,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # --- SLURM email notifications ---
 # Uses Southampton email derived from $USER. Override in ~/.bash_aliases if needed.
-export NOTIFY_EMAIL="${USER}@soton.ac.uk"
+export NOTIFY_EMAIL="${NOTIFY_EMAIL:-${USER}@soton.ac.uk}"
 
 # --- Run directory helper ---
 # Creates the next run_N directory inside a package dir.

@@ -60,6 +60,22 @@ def parse_args(base_parser, args, namespace):
         choices=['causal', 'bidirectional'],
         help='Token-attention direction. The default preserves causal language-model behavior.',
     )
+    parser.add_argument(
+    "--lstm_forget_gate",
+    choices=("learned", "none"),
+    default="learned",
+    )
+    parser.add_argument(
+        "--lstm_control_input",
+        choices=("previous_and_proposed", "proposed"),
+        default="previous_and_proposed",
+    )
+    parser.add_argument(
+        "--lstm_persistent_cell",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Carry the LSTM cell across recurrent middle-stack repeats.",
+    )
     parser.add_argument('--dtype', default="torch.bfloat16", type=str)
     parser.add_argument('--bias', default=False, type=bool)
     parser.add_argument('--compile', action='store_true') # if true then model is compiled 
@@ -75,7 +91,7 @@ def parse_args(base_parser, args, namespace):
     parser.add_argument('--n_repeat', default=2, type=int)
     parser.add_argument('--min_repeat', default=1, type=int)
     parser.add_argument('--depth_random_method', default='uniform', type=str)
-    parser.add_argument('--depth_embedding', default=None, type=none_or_str)
+    parser.add_argument('--depth_embedding', default=None, type=none_or_str)             # TODO cbtm
     parser.add_argument('--n_layer_begin', default=0, type=int) # depths in att + ff blocks
     parser.add_argument('--n_layer_end', default=0, type=int) # depths in att + ff blocks
     parser.add_argument('--mod_capacity_factor', default=0.6, type=float)
