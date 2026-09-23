@@ -39,7 +39,10 @@ CHECKPOINT_TYPES = (
     "best_id",
     "best_extrapolation_strict",
     "best_extrapolation_unconstrained",
+    
 )
+AVAILABLE_CHECKPOINT_TYPES = (*CHECKPOINT_TYPES, "best_average_extrap")
+
 CHECKPOINT_METADATA_CANDIDATES = {
     "best_id": ("best_id.json", "best.json"),
     "best_extrapolation_strict": (
@@ -49,12 +52,14 @@ CHECKPOINT_METADATA_CANDIDATES = {
     "best_extrapolation_unconstrained": (
         "best_extrapolation_unconstrained.json",
     ),
+    "best_average_extrap": ("best_average_extrap.json",),
 }
 CHECKPOINT_FILE_DEFAULTS = {
     "best_id.json": "best_id.pt",
     "best.json": "best.pt",
     "best_extrapolation_strict.json": "best_extrapolation_strict.pt",
     "best_extrapolation.json": "best_extrapolation.pt",
+    "best_average_extrap.json": "best_average_extrap.pt",
     "best_extrapolation_unconstrained.json": (
         "best_extrapolation_unconstrained.pt"
     ),
@@ -68,6 +73,15 @@ def parse_args(argv=None):
     parser.add_argument("--output-run-dir", type=Path, required=True)
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+    "--checkpoint-type",
+    choices=AVAILABLE_CHECKPOINT_TYPES,    help="Evaluate only this checkpoint; default is all three.",
+    )
+    parser.add_argument(
+        "--max-repeats",
+        type=int,
+        help="Override the repeat diagnostic depth and test horizons.",
+    )
     return parser.parse_args(argv)
 
 
@@ -217,10 +231,10 @@ def validate_source_run(source_run_dir):
         manifest["resolved_args"], "manifest.resolved_args"
     )
     model_name = model.get("model", resolved.get("model"))
-    if model_name != "but_full_depth":
+    if model_name not in {"but_full_depth", "lstm_ut_bidir"}:
         raise ValueError(
-            "standalone BUT evaluation requires model='but_full_depth'; "
-            f"found {model_name!r}"
+            "standalone evaluation requires model='but_full_depth' or "
+            f"'lstm_ut_bidir'; found {model_name!r}"
         )
     provenance = _require_mapping(manifest["provenance"], "manifest.provenance")
     checkpoint_dir_value = provenance.get("checkpoint_dir")
@@ -321,10 +335,17 @@ def build_evaluation_manifest(
     artifact_dir,
     checkpoint_dir,
     compatibility_fallbacks=(),
+    checkpoint_types=CHECKPOINT_TYPES,
+    diagnostic_max_repeats=None,
+    diagnostic_horizons=None,
 ):
     resolved_args = copy.deepcopy(_merge_manifest_sections(source_manifest))
     for fallback in compatibility_fallbacks:
         resolved_args[fallback["field"]] = copy.deepcopy(fallback["value"])
+    if diagnostic_max_repeats is not None:
+        resolved_args["ca_repeat_diagnostic_max_repeats"] = diagnostic_max_repeats
+        resolved_args["ca_final_repeat_diagnostic_max_repeats"] = diagnostic_max_repeats
+        resolved_args["ca_repeat_diagnostic_horizons"] = list(diagnostic_horizons)
     resolved_args["repeat_cache_window"] = forward_policy_metadata(
         source_manifest
     )["repeat_cache_window"]
@@ -333,9 +354,10 @@ def build_evaluation_manifest(
     source_tags = list(source_annotations.get("tags", []) or [])
     resolved_args["ca_tags"] = list(dict.fromkeys([*source_tags, "standalone_eval"]))
     resolved_args["ca_note"] = (
-        "Standalone final-test evaluation of the source run's ID, strict "
-        "extrapolation, and unconstrained extrapolation checkpoints."
-    )
+        "Standalone final-test evaluation of "
+        + ", ".join(checkpoint_types)
+        + "."
+    )   
     manifest = build_run_manifest(
         resolved_args,
         output_run_dir,
@@ -352,9 +374,15 @@ def build_evaluation_manifest(
         }
     )
     manifest["standalone_evaluation"] = {
-        "checkpoint_types": list(CHECKPOINT_TYPES),
+        "checkpoint_types": list(checkpoint_types),
         "attention_diagnostics": False,
         "source_run_id": source_manifest["run_id"],
+        "diagnostic_max_repeats": diagnostic_max_repeats,
+        "diagnostic_horizons": (
+            list(diagnostic_horizons)
+            if diagnostic_horizons is not None
+            else None
+        ),
     }
     errors = validate_manifest(manifest)
     if errors:
@@ -371,12 +399,28 @@ def run_standalone_evaluation(args):
     model_args, compatibility_fallbacks = resolve_source_args(
         manifest, args.device
     )
+    selected_type = getattr(args, "checkpoint_type", None)
+    checkpoint_types = (selected_type,) if selected_type else CHECKPOINT_TYPES
+
+    requested_max_repeats = getattr(args, "max_repeats", None)
+    if requested_max_repeats is not None:
+        if requested_max_repeats <= 0:
+            raise ValueError("--max-repeats must be positive")
+        diagnostic_max_repeats = requested_max_repeats
+        diagnostic_horizons = list(range(requested_max_repeats + 1))
+    else:
+        diagnostic_max_repeats = getattr(
+            model_args, "ca_repeat_diagnostic_max_repeats", None
+        )
+        diagnostic_horizons = getattr(
+            model_args, "ca_repeat_diagnostic_horizons", None
+        )
     stats = read_validated_training_stats(checkpoint_dir)
     checkpoint_specs = {
         checkpoint_type: _read_checkpoint_metadata(
             checkpoint_dir, checkpoint_type
         )
-        for checkpoint_type in CHECKPOINT_TYPES
+        for checkpoint_type in checkpoint_types
     }
     output_run_dir = args.output_run_dir.resolve()
     artifact_dir = args.artifact_dir.resolve()
@@ -398,6 +442,11 @@ def run_standalone_evaluation(args):
         artifact_dir,
         checkpoint_dir,
         compatibility_fallbacks,
+        checkpoint_types=checkpoint_types,
+        diagnostic_max_repeats=requested_max_repeats,
+        diagnostic_horizons=(
+            diagnostic_horizons if requested_max_repeats is not None else None
+        ),
     )
     write_run_manifest(output_run_dir, output_manifest)
     ensure_notes_file(output_run_dir)
@@ -433,7 +482,7 @@ def run_standalone_evaluation(args):
         )
         analyses = {}
         checkpoint_sources = {}
-        for checkpoint_type in CHECKPOINT_TYPES:
+        for checkpoint_type in checkpoint_types:
             metadata, checkpoint_path = checkpoint_specs[checkpoint_type]
             load_checkpoint_weights(
                 model, checkpoint_path, metadata, model_args.device
@@ -454,12 +503,8 @@ def run_standalone_evaluation(args):
                 final_eval_max_batches=getattr(
                     model_args, "ca_final_eval_max_batches", None
                 ),
-                repeat_diagnostic_max_repeats=getattr(
-                    model_args, "ca_repeat_diagnostic_max_repeats", None
-                ),
-                repeat_diagnostic_horizons=getattr(
-                    model_args, "ca_repeat_diagnostic_horizons", None
-                ),
+                repeat_diagnostic_max_repeats=diagnostic_max_repeats,
+                repeat_diagnostic_horizons=diagnostic_horizons,
                 repeat_diagnostic_max_batches=getattr(
                     model_args, "ca_repeat_diagnostic_max_batches", None
                 ),
@@ -470,16 +515,25 @@ def run_standalone_evaluation(args):
             )
             checkpoint_sources[checkpoint_type] = str(checkpoint_path)
 
-        stats["best_id"] = analyses["best_id"]["checkpoint"]
-        stats["best_extrapolation_strict"] = analyses[
-            "best_extrapolation_strict"
-        ]["checkpoint"]
-        stats["best_extrapolation_unconstrained"] = analyses[
-            "best_extrapolation_unconstrained"
-        ]["checkpoint"]
-        stats["best"] = stats["best_id"]
-        stats["best_extrapolation"] = stats["best_extrapolation_strict"]
-        stats["final_eval"] = analyses["best_id"]["task_metrics"]
+        if len(checkpoint_types) != len(CHECKPOINT_TYPES):
+            for key in (
+                "best_id",
+                "best_extrapolation_strict",
+                "best_extrapolation_unconstrained",
+                "best",
+                "best_extrapolation",
+                "best_average_extrap",
+                "final_eval",
+            ):
+                stats.pop(key, None)
+
+        for checkpoint_type in checkpoint_types:
+            stats[checkpoint_type] = analyses[checkpoint_type]["checkpoint"]
+        if "best_id" in analyses:
+            stats["best"] = stats["best_id"]
+            stats["final_eval"] = analyses["best_id"]["task_metrics"]
+        if "best_extrapolation_strict" in analyses:
+            stats["best_extrapolation"] = stats["best_extrapolation_strict"]
         stats["checkpoint_analysis"] = analyses
         stats["standalone_evaluation"] = {
             "source_run_id": manifest["run_id"],

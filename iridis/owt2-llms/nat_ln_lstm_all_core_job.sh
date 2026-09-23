@@ -15,7 +15,7 @@ N_GPUS=2          # Must match --gres=gpu:N above
 N_LAYER=12        # Paper uses 24 for Table 2 ablation
 N_REPEAT=8        # Number of block repeats
 ITERATIONS=40000  # Training steps
-BATCH_SIZE=32       # Per-GPU micro-batch 
+BATCH_SIZE=128       # Per-GPU micro-batch 
 ACC_STEPS=2      # Gradient accumulation 
 CKPT_FREQ=2000    # Save and evaluate every 2000 steps. This controls evaluation frequency as well
 N_EMBD=384
