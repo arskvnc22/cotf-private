@@ -65,7 +65,7 @@ fi
 # Compute-node execution. Use the path exported by the wrapper.
 if [ -z "${REPO_DIR:-}" ]; then
     echo "ERROR: REPO_DIR was not exported by the submission wrapper." >&2
-    echo "Submit with: bash iridis/owt2-llms/cotf_job.sh" >&2
+    echo "Submit with: bash iridis/owt2-llms/natapat_but_job.sh" >&2
     exit 1
 fi
 
@@ -102,6 +102,14 @@ module load conda
 eval "$(conda shell.bash hook)"
 conda activate "$CONDA_ENV_PREFIX"
 EXPNAME="nat_but_ndim_${N_EMBD}_beg_${N_LAYER_BEGIN}_mid_${N_REPEAT}_end_${N_LAYER_END}"
+for arg in "$@"; do
+    case "$arg" in
+        --exp_name|--exp_name=*|--model|--model=*|--dataset|--dataset=*|--results_base_folder|--results_base_folder=*)
+            echo "ERROR: $arg is fixed by this job script." >&2
+            exit 2
+            ;;
+    esac
+done
 export WANDB_MODE=disabled
 unset WANDB_RESUME WANDB_RUN_ID WANDB_NAME
 cd "$REPO_DIR"
@@ -146,13 +154,19 @@ TRAIN_ARGS=(
     --n_layer_end "$N_LAYER_END"
     --save_checkpoint_freq "$CKPT_FREQ"
     --results_base_folder "$EXPS_DIR"
-    --exp_name "$EXPNAME"
     --use_pretrained auto
     --lstm_forget_gate learned
     --lstm_control_input previous_and_proposed
     "${CELL_FLAG[@]}"
     "$@"
 )
+
+if (( $# > 0 )); then
+    digest=$(printf '%s\0' "${TRAIN_ARGS[@]}" | sha256sum)
+    digest=${digest%% *}
+    EXPNAME="nat_but_cli_${digest:0:16}"
+fi
+TRAIN_ARGS+=(--exp_name "$EXPNAME")
 
 # --- Launch ---
 if [ "$N_GPUS" -gt 1 ]; then
@@ -176,7 +190,6 @@ EXIT_CODE=$?
 
 echo " Checkpoints: $EXPS_DIR/owt2/but_llm/$EXPNAME"
 echo " If training incomplete, resubmit:"
-echo "   bash iridis/owt2-llms/natapat_but_job.sh"
+echo "   bash iridis/owt2-llms/natapat_but_job.sh with the same arguments"
 
 exit $EXIT_CODE
-

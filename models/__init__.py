@@ -23,6 +23,8 @@ from . import but_llm
 from . import lstm_ut_llm
 from . import lstm_ut_core
 from . import lstm_ut_all_core
+from . import ln_lstm_ut_all_core
+from . import ln_cotformer_llm
 
 
 MODELS = {
@@ -51,6 +53,8 @@ MODELS = {
     "but_llm" : but_llm.GPTBase,
     "lstm_ut_core" : lstm_ut_core.GPTBase,
     "lstm_ut_all_core" : lstm_ut_all_core.GPTBase,
+    "ln_lstm_ut_all_core" : ln_lstm_ut_all_core.GPTBase,
+    "ln_cotformer_llm" : ln_cotformer_llm.GPTBase,
 
     
     

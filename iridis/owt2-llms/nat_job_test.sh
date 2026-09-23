@@ -1,23 +1,23 @@
 #!/bin/bash
-#SBATCH --job-name=nat_owt2_cotf_h200
-#SBATCH --partition=i7_h200
-#SBATCH --account=normal
+#SBATCH --job-name=nat_lstm_core_owt2
+#SBATCH --partition=a100
+#SBATCH --account=ecsstudents
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:2
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
+################################################################################
 
-# ========================= CONFIGURATION ====================================
 
 N_GPUS=2          # Must match --gres=gpu:N above
 N_LAYER=12        # Paper uses 24 for Table 2 ablation
-N_REPEAT=8        # Number of block repeats
-ITERATIONS=40000  # Training steps
-BATCH_SIZE=128      # Per-GPU micro-batch (L4 24GB OOMs at 16 with 108 effective layers)
-ACC_STEPS=2      # Gradient accumulation (DDP halves: per-GPU=8, eff BS = 8*16 = 128)
-CKPT_FREQ=2000    # Save every 2000 steps
+N_REPEAT=5        # Number of block repeats
+ITERATIONS=40  # Training steps
+BATCH_SIZE=128       # Per-GPU micro-batch 
+ACC_STEPS=2      # Gradient accumulation 
+CKPT_FREQ=20    # Save and evaluate every 2000 steps. This controls evaluation frequency as well
 N_EMBD=384
 
 # Reserved layers:
@@ -26,6 +26,15 @@ N_LAYER_END=1
 
 # ========================= END CONFIGURATION ================================
 set -euo pipefail
+LSTM_PERSISTENT_CELL=true
+CELL_MODE="persistent"
+
+if [ "$LSTM_PERSISTENT_CELL" = true ]; then
+    CELL_FLAG=(--lstm_persistent_cell)
+else
+    CELL_MODE="reset_each_repeat"
+    CELL_FLAG=(--no-lstm_persistent_cell)
+fi
 
 # Login-node self-submission only.
 if [ -z "${SLURM_JOB_ID:-}" ]; then
@@ -56,7 +65,7 @@ fi
 # Compute-node execution. Use the path exported by the wrapper.
 if [ -z "${REPO_DIR:-}" ]; then
     echo "ERROR: REPO_DIR was not exported by the submission wrapper." >&2
-    echo "Submit with: bash iridis/owt2-llms/natapat_cotf_job.sh" >&2
+    echo "Submit with: bash iridis/owt2-llms/cotf_job.sh" >&2
     exit 1
 fi
 
@@ -72,36 +81,12 @@ cd "$REPO_DIR"
 EXPS_DIR="/scratch/ab3u21/exps"
 mkdir -p "$EXPS_DIR" "$DATA_DIR" "$HF_HOME" "$TIKTOKEN_CACHE_DIR" "$WANDB_DIR"
 
-echo "========================================="
-echo " CoTFormer + Reserved Layers Training"
-echo " User:          $USER"
-echo " Node:          $(hostname)"
-echo " CPUs:          $SLURM_CPUS_PER_TASK"
-echo " GPUs:          $N_GPUS"
-echo " Job ID:        $SLURM_JOB_ID"
-echo " Model:         cotformer_full_depth"
-echo " Architecture:  ${N_LAYER}L (${N_LAYER_BEGIN}->mid*${N_REPEAT}->${N_LAYER_END})"
-echo " Iterations:    $ITERATIONS"
-echo " Eff. BS:       $((BATCH_SIZE * ACC_STEPS))"
-echo " Checkpoint:    every $CKPT_FREQ steps -> $EXPS_DIR"
-echo " Data dir:      $DATA_DIR"
-echo " Started:       $(date)"
-echo "========================================="
 
 # --- Environment ---
 module load conda
 eval "$(conda shell.bash hook)"
 conda activate "$CONDA_ENV_PREFIX"
-EXPNAME="nat_cotf_ndim_${N_EMBD}_beg_${N_LAYER_BEGIN}_mid_${N_REPEAT}_end_${N_LAYER_END}"
-for arg in "$@"; do
-    case "$arg" in
-        --exp_name|--exp_name=*|--model|--model=*|--dataset|--dataset=*|--results_base_folder|--results_base_folder=*)
-            echo "ERROR: $arg is fixed by this job script." >&2
-            exit 2
-            ;;
-    esac
-done
-
+EXPNAME="nat_lstm_ut_all_core_pc_40k_ndim_${N_EMBD}_${CELL_MODE}_beg_${N_LAYER_BEGIN}_mid_${N_REPEAT}_end_${N_LAYER_END}"
 export WANDB_MODE=disabled
 unset WANDB_RESUME WANDB_RUN_ID WANDB_NAME
 
@@ -126,7 +111,7 @@ fi
 # or min_repeat. The model always runs all n_repeat iterations unconditionally.
 TRAIN_ARGS=(
     --config_format base
-    --model cotformer_llm
+    --model lstm_ut_all_core
     --n_embd "$N_EMBD"
     --n_head 6
     --n_layer "$N_LAYER"
@@ -147,16 +132,13 @@ TRAIN_ARGS=(
     --n_layer_end "$N_LAYER_END"
     --save_checkpoint_freq "$CKPT_FREQ"
     --results_base_folder "$EXPS_DIR"
+    --exp_name "$EXPNAME"
     --use_pretrained auto
+    --lstm_forget_gate learned
+    --lstm_control_input previous_and_proposed
+    "${CELL_FLAG[@]}"
     "$@"
 )
-
-if (( $# > 0 )); then
-    digest=$(printf '%s\0' "${TRAIN_ARGS[@]}" | sha256sum)
-    digest=${digest%% *}
-    EXPNAME="nat_cotf_cli_${digest:0:16}"
-fi
-TRAIN_ARGS+=(--exp_name "$EXPNAME")
 
 # --- Launch ---
 if [ "$N_GPUS" -gt 1 ]; then
@@ -178,8 +160,18 @@ fi
 
 EXIT_CODE=$?
 
-echo " Checkpoints: $EXPS_DIR/owt2/cotformer_llm/$EXPNAME"
+echo "========================================="
+echo " Training finished: $(date)"
+echo " Exit code: $EXIT_CODE"
+echo ""
+echo " Checkpoints: $EXPS_DIR/owt2/cotformer_full_depth/"
+echo ""
 echo " If training incomplete, resubmit:"
-echo "   bash iridis/owt2-llms/natapat_cotf_job.sh with the same arguments"
+echo "   bash iridis/cot-res-train/job.sh"
+echo ""
+echo " After training completes, sync WandB:"
+echo "   wandb sync $WANDB_DIR/<offline-run-*>"
+echo "========================================="
 
 exit $EXIT_CODE
+

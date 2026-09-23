@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=nat_owt2_cotf_h200
+#SBATCH --job-name=nat_owt2_ln_cotf_h200
 #SBATCH --partition=i7_h200
 #SBATCH --account=normal
 #SBATCH --nodes=1
@@ -56,7 +56,7 @@ fi
 # Compute-node execution. Use the path exported by the wrapper.
 if [ -z "${REPO_DIR:-}" ]; then
     echo "ERROR: REPO_DIR was not exported by the submission wrapper." >&2
-    echo "Submit with: bash iridis/owt2-llms/natapat_cotf_job.sh" >&2
+    echo "Submit with: bash iridis/owt2-llms/nat_ln_cotf_job.sh" >&2
     exit 1
 fi
 
@@ -92,7 +92,7 @@ echo "========================================="
 module load conda
 eval "$(conda shell.bash hook)"
 conda activate "$CONDA_ENV_PREFIX"
-EXPNAME="nat_cotf_ndim_${N_EMBD}_beg_${N_LAYER_BEGIN}_mid_${N_REPEAT}_end_${N_LAYER_END}"
+EXPNAME="nat_ln_cotf_ndim_${N_EMBD}_beg_${N_LAYER_BEGIN}_mid_${N_REPEAT}_end_${N_LAYER_END}"
 for arg in "$@"; do
     case "$arg" in
         --exp_name|--exp_name=*|--model|--model=*|--dataset|--dataset=*|--results_base_folder|--results_base_folder=*)
@@ -126,7 +126,7 @@ fi
 # or min_repeat. The model always runs all n_repeat iterations unconditionally.
 TRAIN_ARGS=(
     --config_format base
-    --model cotformer_llm
+    --model ln_cotformer_llm
     --n_embd "$N_EMBD"
     --n_head 6
     --n_layer "$N_LAYER"
@@ -154,7 +154,7 @@ TRAIN_ARGS=(
 if (( $# > 0 )); then
     digest=$(printf '%s\0' "${TRAIN_ARGS[@]}" | sha256sum)
     digest=${digest%% *}
-    EXPNAME="nat_cotf_cli_${digest:0:16}"
+    EXPNAME="nat_ln_cotf_cli_${digest:0:16}"
 fi
 TRAIN_ARGS+=(--exp_name "$EXPNAME")
 
@@ -178,8 +178,8 @@ fi
 
 EXIT_CODE=$?
 
-echo " Checkpoints: $EXPS_DIR/owt2/cotformer_llm/$EXPNAME"
+echo " Checkpoints: $EXPS_DIR/owt2/ln_cotformer_llm/$EXPNAME"
 echo " If training incomplete, resubmit:"
-echo "   bash iridis/owt2-llms/natapat_cotf_job.sh with the same arguments"
+echo "   bash iridis/owt2-llms/nat_ln_cotf_job.sh with the same arguments"
 
 exit $EXIT_CODE
