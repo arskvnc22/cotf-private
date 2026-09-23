@@ -15,7 +15,7 @@ N_GPUS=2          # Must match --gres=gpu:N above
 N_LAYER=12        # Paper uses 24 for Table 2 ablation
 N_REPEAT=8        # Number of block repeats
 ITERATIONS=40000  # Training steps
-BATCH_SIZE=128       # Per-GPU micro-batch 
+BATCH_SIZE=32       # Per-GPU micro-batch 
 ACC_STEPS=2      # Gradient accumulation 
 CKPT_FREQ=2000    # Save and evaluate every 2000 steps. This controls evaluation frequency as well
 N_EMBD=384
@@ -86,7 +86,7 @@ mkdir -p "$EXPS_DIR" "$DATA_DIR" "$HF_HOME" "$TIKTOKEN_CACHE_DIR" "$WANDB_DIR"
 module load conda
 eval "$(conda shell.bash hook)"
 conda activate "$CONDA_ENV_PREFIX"
-EXPNAME="nat_ln_lstm_ut_all_core_pc_40k_ndim_${N_EMBD}_${CELL_MODE}_beg_${N_LAYER_BEGIN}_mid_${N_REPEAT}_end_${N_LAYER_END}"
+EXPNAME="nat_real_ln_lstm_ut_all_core_pc_40k_ndim_${N_EMBD}_${CELL_MODE}_beg_${N_LAYER_BEGIN}_mid_${N_REPEAT}_end_${N_LAYER_END}"
 for arg in "$@"; do
     case "$arg" in
         --exp_name|--exp_name=*|--model|--model=*|--dataset|--dataset=*|--results_base_folder|--results_base_folder=*)
